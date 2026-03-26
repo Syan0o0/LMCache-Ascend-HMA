@@ -325,6 +325,21 @@ def _patch_wait_for_save():
         ascend_wait_for_save
     )
 
+def _patch_start_load_kv():
+    # Third Party
+    import lmcache.integration.vllm.vllm_v1_adapter
+
+    # First Party
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        start_load_kv as ascend_start_load_kv,
+    )
+
+    # Route worker-side KV loading through the Ascend-specific adapter so
+    # HMA requests can pass slot_mappings_by_group into the LMCache engine.
+    lmcache.integration.vllm.vllm_v1_adapter.LMCacheConnectorV1Impl.start_load_kv = (
+        ascend_start_load_kv
+    )
+
 
 def _patch_hash_token():
     # On OpenEuler and python3.10,
@@ -470,6 +485,7 @@ if not LMCACHE_ASCEND_PATCHED:
             _patch_sys_detection()
 
         _patch_wait_for_save()
+        _patch_start_load_kv()
 
     if _build_info.__framework_name__ == "mindspore":
         # First Party

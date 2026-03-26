@@ -25,11 +25,22 @@ import torch
 
 # First Party
 from lmcache_ascend.v1.npu_connector import (
+    KVCacheFormat,
+    _NPUV3GroupContext,
     SGLangLayerwiseNPUConnector,
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
+    VLLMPagedMemNPUConnectorV3,
 )
 from tests.v1.utils import check_sglang_npu_kv_cache_equal, generate_sglang_npu_kv_cache
+
+
+class _FakeMemoryObj:
+    def __init__(self, tensors):
+        self._tensors = tensors
+
+    def get_tensor(self, index: int):
+        return self._tensors[index]
 
 
 @pytest.mark.parametrize("use_npu", [True, False])
@@ -206,3 +217,216 @@ def test_sglang_layerwise_connector_with_npu(use_gpu, use_mla):
     )
 
     allocator.close()
+
+
+def test_vllm_paged_connector_v3_gdn_copy_helpers():
+    connector = object.__new__(VLLMPagedMemNPUConnectorV3)
+
+    conv_layer0 = torch.tensor(
+        [[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]], dtype=torch.float16
+    )
+    ssm_layer0 = torch.tensor(
+        [[100.0, 101.0], [200.0, 201.0], [300.0, 301.0]], dtype=torch.float32
+    )
+    conv_layer1 = torch.tensor(
+        [[12.0, 13.0], [22.0, 23.0], [32.0, 33.0]], dtype=torch.float16
+    )
+    ssm_layer1 = torch.tensor(
+        [[102.0, 103.0], [202.0, 203.0], [302.0, 303.0]], dtype=torch.float32
+    )
+    connector.kvcaches = [
+        [conv_layer0, ssm_layer0],
+        [conv_layer1, ssm_layer1],
+    ]
+
+    attention_placeholder = torch.zeros((1,), dtype=torch.float16)
+    conv_snapshot = torch.zeros((2, 2), dtype=torch.float16)
+    ssm_snapshot = torch.zeros((2, 2), dtype=torch.float32)
+    memory_obj = _FakeMemoryObj([attention_placeholder, conv_snapshot, ssm_snapshot])
+
+    group_ctx = _NPUV3GroupContext(
+        group_idx=1,
+        layer_indices=[0, 1],
+        num_layers=2,
+        kv_format=KVCacheFormat.GDN_ALIGN_STATE,
+        group_kind="gdn",
+        num_tensors=2,
+        memory_tensor_start=1,
+        memory_tensor_end=3,
+        block_size=2,
+        tensor_names=["conv_state", "ssm_state"],
+    )
+
+    connector._copy_gdn_group_from_gpu(
+        memory_obj,
+        group_ctx,
+        end=4,
+        block_ids_by_group=([7, 8], [0, 1, 2]),
+    )
+
+    assert torch.equal(conv_snapshot[0], conv_layer0[1])
+    assert torch.equal(conv_snapshot[1], conv_layer1[1])
+    assert torch.equal(ssm_snapshot[0], ssm_layer0[1])
+    assert torch.equal(ssm_snapshot[1], ssm_layer1[1])
+
+    conv_layer0.zero_()
+    conv_layer1.zero_()
+    ssm_layer0.zero_()
+    ssm_layer1.zero_()
+
+    connector._copy_gdn_group_to_gpu(
+        memory_obj,
+        group_ctx,
+        end=4,
+        block_ids_by_group=([7, 8], [0, 1, 2]),
+    )
+
+    assert torch.equal(conv_layer0[1], conv_snapshot[0])
+    assert torch.equal(conv_layer1[1], conv_snapshot[1])
+    assert torch.equal(ssm_layer0[1], ssm_snapshot[0])
+    assert torch.equal(ssm_layer1[1], ssm_snapshot[1])
+
+
+def test_vllm_paged_connector_v3_attention_tuple_python_copy_helpers():
+    connector = object.__new__(VLLMPagedMemNPUConnectorV3)
+
+    class _DummyGroup:
+        hidden_dim_size = 2
+
+    class _DummyGroupsManager:
+        kv_layer_groups = [_DummyGroup()]
+
+    class _DummyMetadata:
+        kv_layer_groups_manager = _DummyGroupsManager()
+
+    connector.metadata = _DummyMetadata()
+    connector.device = torch.device("cpu")
+    connector.kvcaches = [
+        (
+            torch.tensor(
+                [
+                    [[[1.0, 2.0]], [[3.0, 4.0]]],
+                    [[[5.0, 6.0]], [[7.0, 8.0]]],
+                ],
+                dtype=torch.float16,
+            ),
+            torch.tensor(
+                [
+                    [[[11.0, 12.0]], [[13.0, 14.0]]],
+                    [[[15.0, 16.0]], [[17.0, 18.0]]],
+                ],
+                dtype=torch.float16,
+            ),
+        ),
+        (
+            torch.tensor(
+                [
+                    [[[21.0, 22.0]], [[23.0, 24.0]]],
+                    [[[25.0, 26.0]], [[27.0, 28.0]]],
+                ],
+                dtype=torch.float16,
+            ),
+            torch.tensor(
+                [
+                    [[[31.0, 32.0]], [[33.0, 34.0]]],
+                    [[[35.0, 36.0]], [[37.0, 38.0]]],
+                ],
+                dtype=torch.float16,
+            ),
+        ),
+    ]
+
+    slot_mapping = torch.tensor([1, 3], dtype=torch.long)
+    memory_tensor = torch.zeros((2, 2, 2, 2), dtype=torch.float16)
+    memory_obj = _FakeMemoryObj([memory_tensor])
+
+    group_ctx = _NPUV3GroupContext(
+        group_idx=0,
+        layer_indices=[0, 1],
+        num_layers=2,
+        kv_format=KVCacheFormat.SEPARATE_KV,
+        memory_tensor_start=0,
+        memory_tensor_end=1,
+    )
+
+    connector._copy_attention_group_from_gpu_python(memory_obj, group_ctx, slot_mapping)
+
+    assert torch.equal(memory_tensor[0, 0, 0], torch.tensor([3.0, 4.0], dtype=torch.float16))
+    assert torch.equal(memory_tensor[0, 0, 1], torch.tensor([7.0, 8.0], dtype=torch.float16))
+    assert torch.equal(memory_tensor[1, 1, 0], torch.tensor([33.0, 34.0], dtype=torch.float16))
+    assert torch.equal(memory_tensor[1, 1, 1], torch.tensor([37.0, 38.0], dtype=torch.float16))
+
+    connector.kvcaches[0][0].zero_()
+    connector.kvcaches[0][1].zero_()
+    connector.kvcaches[1][0].zero_()
+    connector.kvcaches[1][1].zero_()
+
+    connector._copy_attention_group_to_gpu_python(memory_obj, group_ctx, slot_mapping)
+
+    assert torch.equal(
+        connector.kvcaches[0][0].reshape(-1, 2)[slot_mapping],
+        memory_tensor[0, 0],
+    )
+    assert torch.equal(
+        connector.kvcaches[1][1].reshape(-1, 2)[slot_mapping],
+        memory_tensor[1, 1],
+    )
+
+
+def test_vllm_paged_connector_v3_attention_merged_python_copy_helpers():
+    connector = object.__new__(VLLMPagedMemNPUConnectorV3)
+
+    class _DummyGroup:
+        hidden_dim_size = 2
+
+    class _DummyGroupsManager:
+        kv_layer_groups = [_DummyGroup()]
+
+    class _DummyMetadata:
+        kv_layer_groups_manager = _DummyGroupsManager()
+
+    connector.metadata = _DummyMetadata()
+    connector.device = torch.device("cpu")
+    connector.kvcaches = [
+        torch.tensor(
+            [
+                [
+                    [[[1.0, 2.0]], [[3.0, 4.0]]],
+                    [[[5.0, 6.0]], [[7.0, 8.0]]],
+                ],
+                [
+                    [[[11.0, 12.0]], [[13.0, 14.0]]],
+                    [[[15.0, 16.0]], [[17.0, 18.0]]],
+                ],
+            ],
+            dtype=torch.float16,
+        )
+    ]
+
+    slot_mapping = torch.tensor([0, 2], dtype=torch.long)
+    memory_tensor = torch.zeros((2, 1, 2, 2), dtype=torch.float16)
+    memory_obj = _FakeMemoryObj([memory_tensor])
+
+    group_ctx = _NPUV3GroupContext(
+        group_idx=0,
+        layer_indices=[0],
+        num_layers=1,
+        kv_format=KVCacheFormat.MERGED_KV,
+        memory_tensor_start=0,
+        memory_tensor_end=1,
+    )
+
+    connector._copy_attention_group_from_gpu_python(memory_obj, group_ctx, slot_mapping)
+
+    assert torch.equal(memory_tensor[0, 0, 0], torch.tensor([1.0, 2.0], dtype=torch.float16))
+    assert torch.equal(memory_tensor[0, 0, 1], torch.tensor([5.0, 6.0], dtype=torch.float16))
+    assert torch.equal(memory_tensor[1, 0, 0], torch.tensor([11.0, 12.0], dtype=torch.float16))
+    assert torch.equal(memory_tensor[1, 0, 1], torch.tensor([15.0, 16.0], dtype=torch.float16))
+
+    connector.kvcaches[0].zero_()
+    connector._copy_attention_group_to_gpu_python(memory_obj, group_ctx, slot_mapping)
+
+    merged_k = connector.kvcaches[0][0].reshape(-1, 2)
+    merged_v = connector.kvcaches[0][1].reshape(-1, 2)
+    assert torch.equal(merged_k[slot_mapping], memory_tensor[0, 0])
+    assert torch.equal(merged_v[slot_mapping], memory_tensor[1, 0])

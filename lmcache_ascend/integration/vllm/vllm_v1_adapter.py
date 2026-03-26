@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 
 # Third Party
 from lmcache.config import LMCacheEngineMetadata
@@ -38,7 +38,9 @@ if _build_info.__framework_name__ == "pytorch":
         VLLMBufferLayerwiseNPUConnector,
         VLLMPagedMemLayerwiseNPUConnector,
         VLLMPagedMemNPUConnectorV2,
+        VLLMPagedMemNPUConnectorV3,
     )
+    HAS_NPU_CONNECTOR_V3 = True
 elif _build_info.__framework_name__ == "mindspore":
     # First Party
     from lmcache_ascend.mindspore.v1.npu_connector import (
@@ -46,9 +48,54 @@ elif _build_info.__framework_name__ == "mindspore":
         VLLMPagedMemLayerwiseNPUConnector,
         VLLMPagedMemNPUConnectorV2,
     )
+    HAS_NPU_CONNECTOR_V3 = False
 
 logger = init_logger(__name__)
 
+def _get_request_slot_mappings_on_device(
+    self,
+    request,
+) -> Tuple[torch.Tensor, ...]:
+    slot_mappings_by_group = request.slot_mappings_by_group
+    if not isinstance(slot_mappings_by_group, tuple):
+        raise ValueError("request.slot_mappings_by_group must be a tuple")
+
+    return tuple(
+        slot_mapping.to(self.device)
+        for slot_mapping in slot_mappings_by_group
+    )
+
+def _assert_non_layerwise_hma_path(
+    self,
+    slot_mappings_by_group: Tuple[torch.Tensor, ...],
+    op_name: str,
+) -> None:
+    if len(slot_mappings_by_group) <= 1:
+        return
+
+    if self.use_layerwise:
+        raise NotImplementedError(
+            f"{op_name} does not support multi-group KV cache with "
+            "layerwise NPU connector yet."
+        )
+
+    if not self.config.use_gpu_connector_v3:
+        raise NotImplementedError(
+            f"{op_name} received multi-group KV cache, but "
+            "LMCache-Ascend is not using NPU connector V3 yet."
+        )
+
+    if not HAS_NPU_CONNECTOR_V3:
+        raise NotImplementedError(
+            f"{op_name} does not support multi-group KV cache on the current "
+            "framework backend yet."
+        )
+
+    if not isinstance(self.lmcache_engine.gpu_connector, VLLMPagedMemNPUConnectorV3):
+        raise NotImplementedError(
+            f"{op_name} received multi-group KV cache, but the active connector "
+            "is not VLLMPagedMemNPUConnectorV3."
+        )
 
 # We need to patch this function due to connector modification
 def init_lmcache_engine(
@@ -167,10 +214,14 @@ def init_lmcache_engine(
             )
         tpg = get_tp_group()
     else:
-        # TODO (gingfung): gpu_connector_v3
+         # TODO (gingfung): gpu_connector_v3
         if lmcache_config.use_gpu_connector_v3:
-            raise NotImplementedError(
-                "GPU Connector v3 is not supported yet. Please contact LMCache-Ascend."
+            if not HAS_NPU_CONNECTOR_V3:
+                raise NotImplementedError(
+                    "GPU Connector v3 is not supported on the current framework backend."
+                )
+            vllm_gpu_connector = VLLMPagedMemNPUConnectorV3.from_metadata(
+                metadata, use_gpu, device
             )
         else:
             vllm_gpu_connector = VLLMPagedMemNPUConnectorV2.from_metadata(
@@ -196,6 +247,121 @@ def init_lmcache_engine(
         )
     return engine
 
+@_lmcache_nvtx_annotate
+def start_load_kv(self, forward_context, **kwargs) -> None:
+    """Ascend-patched worker-side load path that understands
+    slot_mappings_by_group for HMA requests.
+    """
+    self.current_layer = 0
+
+    if len(self.kv_caches) == 0:
+        logger.warning(
+            "Please update LMCacheConnector, use register_kv_caches to init kv_caches"
+        )
+        self._init_kv_caches_from_forward_context(forward_context)
+
+    metadata = self._parent._get_connector_metadata()
+    assert isinstance(metadata, LMCacheConnectorMetadata)
+
+    assert len(self.kv_caches) > 0
+    kvcaches = list(self.kv_caches.values())
+
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        logger.debug("In connector.start_load_kv, but the attn_metadata is None")
+        return
+
+    assert self.lmcache_engine is not None
+    self.layerwise_retrievers = []
+
+    last_idx = None
+    for idx, request in enumerate(metadata.requests):
+        if request.load_spec is None:
+            continue
+        last_idx = idx
+
+    for idx, request in enumerate(metadata.requests):
+        if request.load_spec is None:
+            continue
+
+        tokens = request.token_ids
+        slot_mappings_by_group = _get_request_slot_mappings_on_device(self, request)
+        if len(slot_mappings_by_group) > 1:
+            _assert_non_layerwise_hma_path(
+                self,
+                slot_mappings_by_group,
+                "start_load_kv",
+            )
+
+        token_mask = torch.ones(len(tokens), dtype=torch.bool)
+        masked_token_count = (
+            request.load_spec.vllm_cached_tokens
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
+        )
+        token_mask[:masked_token_count] = False
+
+        lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+
+        if self.use_layerwise:
+            slot_mapping = slot_mappings_by_group[0]
+            assert len(tokens) == len(slot_mapping)
+            sync = idx == last_idx
+
+            if self.enable_blending:
+                self.blender.blend(
+                    tokens[:lmcache_cached_tokens],
+                    token_mask[:lmcache_cached_tokens],
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                )
+            else:
+                layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                    tokens[:lmcache_cached_tokens],
+                    token_mask[:lmcache_cached_tokens],
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    sync=sync,
+                )
+                next(layerwise_retriever)
+                next(layerwise_retriever)
+                self.layerwise_retrievers.append(layerwise_retriever)
+        else:
+            ret_token_mask = self.lmcache_engine.retrieve(
+                tokens[:lmcache_cached_tokens],
+                token_mask[:lmcache_cached_tokens],
+                kvcaches=kvcaches,
+                slot_mappings_by_group=tuple(
+                    slot_mapping[:lmcache_cached_tokens]
+                    for slot_mapping in slot_mappings_by_group
+                ),
+                block_ids_by_group=request.allocated_block_ids_by_group,
+                request_configs=request.request_configs,
+                req_id=request.req_id,
+                skip_contains_check=True,
+            )
+
+            num_retrieved_tokens = ret_token_mask.sum().item()
+            num_expected_tokens = (
+                lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+            )
+            if num_retrieved_tokens < num_expected_tokens:
+                logger.error(
+                    "Request %s"
+                    "The number of retrieved tokens is less than the "
+                    "expected number of tokens! This should not happen!",
+                    request.req_id,
+                )
+                logger.error(
+                    "Num retrieved tokens: %d, num expected tokens: %d",
+                    num_retrieved_tokens,
+                    num_expected_tokens,
+                )
+
+        self._stats_monitor.update_interval_vllm_hit_tokens(
+            request.load_spec.vllm_cached_tokens
+        )
+        self._stats_monitor.update_interval_prompt_tokens(len(tokens))
 
 # Patching wait_for_save to remove the PD disagg_spec skip_leading_tokens
 # override. The upstream code does:
@@ -241,11 +407,30 @@ def wait_for_save(self):
 
         token_ids = request.token_ids
 
-        slot_mapping = request.slot_mapping
-        assert isinstance(slot_mapping, torch.Tensor)
-        assert len(slot_mapping) == len(token_ids)
+        # slot_mapping = request.slot_mapping
+        # assert isinstance(slot_mapping, torch.Tensor)
+        # assert len(slot_mapping) == len(token_ids)
 
-        slot_mapping = slot_mapping.to(self.device)
+        # slot_mapping = slot_mapping.to(self.device)
+
+        # slot_mapping = self._get_legacy_single_slot_mapping_on_device(request)
+        # assert isinstance(slot_mapping, torch.Tensor)
+        # assert len(slot_mapping) == len(token_ids)
+
+        slot_mappings_by_group = _get_request_slot_mappings_on_device(self, request)
+        _assert_non_layerwise_hma_path(
+            self,
+            slot_mappings_by_group,
+            "wait_for_save",
+        )
+        if len(slot_mappings_by_group) == 1:
+            slot_mapping = slot_mappings_by_group[0]
+            assert isinstance(slot_mapping, torch.Tensor)
+            assert len(slot_mapping) == len(token_ids)
+        else:
+            for slot_mapping in slot_mappings_by_group:
+                assert isinstance(slot_mapping, torch.Tensor)
+                assert len(slot_mapping) == len(token_ids)
 
         skip_leading_tokens = save_spec.skip_leading_tokens
 
@@ -279,13 +464,19 @@ def wait_for_save(self):
                 )
                 token_ids = token_ids[:aligned_token_len]
                 store_mask = store_mask[:aligned_token_len]
-                slot_mapping = slot_mapping[:aligned_token_len]
+                # slot_mapping = slot_mapping[:aligned_token_len]
+                slot_mappings_by_group = tuple(
+                    slot_mapping[:aligned_token_len]
+                    for slot_mapping in slot_mappings_by_group
+                )
 
         self.lmcache_engine.store(
             token_ids,
             mask=store_mask,
             kvcaches=kvcaches,
-            slot_mapping=slot_mapping,
+            # slot_mapping=slot_mapping,
+            slot_mappings_by_group=slot_mappings_by_group,
+            block_ids_by_group=request.allocated_block_ids_by_group,
             offset=skip_leading_tokens,
             transfer_spec=request.disagg_spec,
             request_configs=request.request_configs,
