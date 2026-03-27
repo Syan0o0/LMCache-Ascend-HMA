@@ -1305,6 +1305,28 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             )
         return slot_mappings_by_group
 
+    def _describe_runtime_kv_cache(self, kv_cache) -> str:
+        if isinstance(kv_cache, torch.Tensor):
+            return (
+                "Tensor("
+                f"shape={tuple(kv_cache.shape)}, "
+                f"dtype={kv_cache.dtype}, "
+                f"device={kv_cache.device})"
+            )
+
+        if isinstance(kv_cache, (tuple, list)):
+            tensor_descriptions: List[str] = []
+            for idx, tensor in enumerate(kv_cache):
+                if isinstance(tensor, torch.Tensor):
+                    tensor_descriptions.append(
+                        f"{idx}:{tuple(tensor.shape)}/{tensor.dtype}/{tensor.device}"
+                    )
+                else:
+                    tensor_descriptions.append(f"{idx}:{type(tensor)}")
+            return f"{type(kv_cache).__name__}[" + ", ".join(tensor_descriptions) + "]"
+
+        return str(type(kv_cache))
+
     def _build_group_pointer_tensor(
         self,
         group_kvcaches: List[Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]]],
@@ -1405,6 +1427,31 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 if layer_idx in group.layer_indices
             ]
             group_kind = group_kinds[group_idx]
+            logger.info(
+                "NPU V3 initializing KV group %d/%d: kind=%s, block_size=%s, "
+                "layer_names=%s, layer_indices=%s",
+                group_idx,
+                len(self.metadata.kv_layer_groups_manager.kv_layer_groups),
+                group_kind,
+                block_sizes_by_group[group_idx],
+                group.layer_names,
+                group.layer_indices,
+            )
+            logger.info(
+                "NPU V3 group %d tensor_specs=%s",
+                group_idx,
+                [
+                    (tensor_spec.name, tuple(tensor_spec.shape), str(tensor_spec.dtype))
+                    for tensor_spec in group.tensor_specs
+                ],
+            )
+            for local_idx, layer_cache in enumerate(group_kvcaches):
+                logger.info(
+                    "NPU V3 group %d runtime cache[%d]=%s",
+                    group_idx,
+                    local_idx,
+                    self._describe_runtime_kv_cache(layer_cache),
+                )
             kv_format = KVCacheFormat.detect(
                 group_kvcaches,
                 use_mla=self.use_mla,
@@ -1430,6 +1477,16 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                     device=self.device,
                 )
             memory_tensor_start, memory_tensor_end = group_transfer_index_ranges[group_idx]
+            logger.info(
+                "NPU V3 group %d detected kv_format=%s, transfer_shapes=%s, "
+                "transfer_dtypes=%s, memory_tensor_range=%s, page_buffer_size=%s",
+                group_idx,
+                kv_format.name,
+                [tuple(shape) for shape in group_transfer_shapes[group_idx]],
+                [str(dtype) for dtype in group_transfer_dtypes[group_idx]],
+                (memory_tensor_start, memory_tensor_end),
+                page_buffer_size,
+            )
 
             self.group_contexts.append(
                 _NPUV3GroupContext(
