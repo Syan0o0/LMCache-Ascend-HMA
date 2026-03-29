@@ -2,6 +2,7 @@
 # Standard
 from dataclasses import dataclass
 from enum import Enum, auto
+import hashlib
 from typing import Any, List, Optional, Set, Tuple, Union
 
 # Third Party
@@ -29,6 +30,82 @@ import lmcache_ascend.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 _IS_310P = None
+
+
+def _summarize_int_values(values: list[int], limit: int = 6) -> str:
+    if not values:
+        return "len=0 values=[]"
+    if len(values) <= limit * 2:
+        return f"len={len(values)} values={values}"
+    return (
+        f"len={len(values)} head={values[:limit]} tail={values[-limit:]}"
+    )
+
+
+def _build_edge_indices(length: int, count: int = 2) -> list[int]:
+    if length <= 0:
+        return []
+    head = list(range(min(count, length)))
+    tail_start = max(len(head), length - count)
+    tail = list(range(tail_start, length))
+    return sorted(set(head + tail))
+
+
+def _tensor_sample_summary(
+    tensor: torch.Tensor,
+    value_limit: int = 6,
+) -> str:
+    detached = tensor.detach()
+    original_shape = tuple(detached.shape)
+    original_dtype = str(detached.dtype)
+    original_device = str(detached.device)
+
+    flat = detached.reshape(-1)
+    sample_indices = _build_edge_indices(flat.numel(), count=value_limit)
+    if sample_indices:
+        sample_index_tensor = torch.tensor(
+            sample_indices,
+            dtype=torch.long,
+            device=flat.device,
+        )
+        sample_cpu = flat.index_select(0, sample_index_tensor).to("cpu")
+    else:
+        sample_cpu = flat.to("cpu")
+
+    if torch.is_floating_point(sample_cpu):
+        sample_cpu = sample_cpu.to(torch.float32)
+        has_nan = bool(torch.isnan(sample_cpu).any().item())
+        has_inf = bool(torch.isinf(sample_cpu).any().item())
+        finite_values = sample_cpu[torch.isfinite(sample_cpu)]
+        absmax = (
+            f"{float(finite_values.abs().max().item()):.6g}"
+            if finite_values.numel() > 0
+            else "nan"
+        )
+        display_values = [f"{float(v):.6g}" for v in sample_cpu.tolist()]
+        hash_payload = sample_cpu.numpy().tobytes()
+    else:
+        has_nan = False
+        has_inf = False
+        sample_cpu = sample_cpu.to(torch.int64)
+        absmax = (
+            str(int(sample_cpu.abs().max().item()))
+            if sample_cpu.numel() > 0
+            else "0"
+        )
+        display_values = [str(int(v)) for v in sample_cpu.tolist()]
+        hash_payload = sample_cpu.numpy().tobytes()
+
+    digest = hashlib.blake2s(hash_payload, digest_size=6).hexdigest()
+    return (
+        f"shape={original_shape} dtype={original_dtype} device={original_device} "
+        f"fp={digest} absmax={absmax} has_nan={has_nan} has_inf={has_inf} "
+        f"sample_indices={sample_indices} values={display_values}"
+    )
+
+
+def _should_log_layer_position(layer_pos: int, total_layers: int) -> bool:
+    return layer_pos == 0 or layer_pos == total_layers - 1
 
 
 def is_310p():
@@ -1583,6 +1660,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         memory_obj: MemoryObj,
         group_ctx: _NPUV3GroupContext,
         slot_mapping: torch.Tensor,
+        req_id: Optional[str] = None,
     ) -> None:
         assert self.kvcaches is not None
         memory_obj_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
@@ -1614,12 +1692,46 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             selected_v = value_view.index_select(0, slot_mapping)
             memory_obj_tensor[0, layer_pos].copy_(selected_k, non_blocking=True)
             memory_obj_tensor[1, layer_pos].copy_(selected_v, non_blocking=True)
+            if _should_log_layer_position(layer_pos, len(group_ctx.layer_indices)):
+                sampled_rows = _build_edge_indices(selected_k.shape[0], count=2)
+                sampled_row_tensor = torch.tensor(
+                    sampled_rows,
+                    dtype=torch.long,
+                    device=selected_k.device,
+                )
+                sampled_slots = slot_mapping.index_select(0, sampled_row_tensor)
+                sampled_source_k = selected_k.index_select(0, sampled_row_tensor)
+                sampled_source_v = selected_v.index_select(0, sampled_row_tensor)
+                sampled_dest_k = memory_obj_tensor[0, layer_pos].index_select(
+                    0, sampled_row_tensor
+                )
+                sampled_dest_v = memory_obj_tensor[1, layer_pos].index_select(
+                    0, sampled_row_tensor
+                )
+                logger.info(
+                    "NPU V3 attention store sample req_id=%s group=%d layer_idx=%d "
+                    "layer_pos=%d slot_rows=%s slot_values=%s source_k=%s "
+                    "dest_k=%s source_v=%s dest_v=%s",
+                    req_id,
+                    group_ctx.group_idx,
+                    layer_idx,
+                    layer_pos,
+                    sampled_rows,
+                    _summarize_int_values(
+                        [int(v) for v in sampled_slots.detach().cpu().tolist()]
+                    ),
+                    _tensor_sample_summary(sampled_source_k),
+                    _tensor_sample_summary(sampled_dest_k),
+                    _tensor_sample_summary(sampled_source_v),
+                    _tensor_sample_summary(sampled_dest_v),
+                )
 
     def _copy_attention_group_to_gpu_python(
         self,
         memory_obj: MemoryObj,
         group_ctx: _NPUV3GroupContext,
         slot_mapping: torch.Tensor,
+        req_id: Optional[str] = None,
     ) -> None:
         assert self.kvcaches is not None
         memory_obj_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
@@ -1659,6 +1771,35 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             )
             key_view.index_copy_(0, slot_mapping, source_k)
             value_view.index_copy_(0, slot_mapping, source_v)
+            if _should_log_layer_position(layer_pos, len(group_ctx.layer_indices)):
+                sampled_rows = _build_edge_indices(source_k.shape[0], count=2)
+                sampled_row_tensor = torch.tensor(
+                    sampled_rows,
+                    dtype=torch.long,
+                    device=source_k.device,
+                )
+                sampled_slots = slot_mapping.index_select(0, sampled_row_tensor)
+                sampled_source_k = source_k.index_select(0, sampled_row_tensor)
+                sampled_source_v = source_v.index_select(0, sampled_row_tensor)
+                sampled_dest_k = key_view.index_select(0, sampled_slots)
+                sampled_dest_v = value_view.index_select(0, sampled_slots)
+                logger.info(
+                    "NPU V3 attention load sample req_id=%s group=%d layer_idx=%d "
+                    "layer_pos=%d slot_rows=%s slot_values=%s source_k=%s "
+                    "dest_k=%s source_v=%s dest_v=%s",
+                    req_id,
+                    group_ctx.group_idx,
+                    layer_idx,
+                    layer_pos,
+                    sampled_rows,
+                    _summarize_int_values(
+                        [int(v) for v in sampled_slots.detach().cpu().tolist()]
+                    ),
+                    _tensor_sample_summary(sampled_source_k),
+                    _tensor_sample_summary(sampled_dest_k),
+                    _tensor_sample_summary(sampled_source_v),
+                    _tensor_sample_summary(sampled_dest_v),
+                )
 
     def _get_gdn_state_block_index(
         self,
@@ -1746,6 +1887,23 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 zip(group_memory_tensors, layer_cache, strict=True)
             ):
                 memory_tensor[layer_pos].copy_(state_tensor[block_id])
+                if _should_log_layer_position(layer_pos, len(group_kvcaches)):
+                    source_state = state_tensor[block_id]
+                    dest_state = memory_tensor[layer_pos]
+                    logger.info(
+                        "NPU V3 gdn store sample req_id=%s group=%d layer_pos=%d "
+                        "layer_idx=%d block_id=%d tensor_idx=%d tensor_name=%s "
+                        "source=%s dest=%s",
+                        kwargs.get("req_id"),
+                        group_ctx.group_idx,
+                        layer_pos,
+                        group_ctx.layer_indices[layer_pos],
+                        block_id,
+                        tensor_idx,
+                        group_ctx.tensor_names[tensor_idx],
+                        _tensor_sample_summary(source_state),
+                        _tensor_sample_summary(dest_state),
+                    )
 
     def _copy_gdn_group_to_gpu(
         self,
@@ -1783,12 +1941,29 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                     f"GDN group {group_ctx.group_idx} expects {group_ctx.num_tensors} "
                     f"runtime tensors, got {len(layer_cache)}."
                 )
-            for memory_tensor, state_tensor in zip(
+            for tensor_idx, (memory_tensor, state_tensor) in enumerate(zip(
                 group_memory_tensors,
                 layer_cache,
                 strict=True,
-            ):
+            )):
                 state_tensor[block_id].copy_(memory_tensor[layer_pos])
+                if _should_log_layer_position(layer_pos, len(group_kvcaches)):
+                    source_state = memory_tensor[layer_pos]
+                    dest_state = state_tensor[block_id]
+                    logger.info(
+                        "NPU V3 gdn load sample req_id=%s group=%d layer_pos=%d "
+                        "layer_idx=%d block_id=%d tensor_idx=%d tensor_name=%s "
+                        "source=%s dest=%s",
+                        kwargs.get("req_id"),
+                        group_ctx.group_idx,
+                        layer_pos,
+                        group_ctx.layer_indices[layer_pos],
+                        block_id,
+                        tensor_idx,
+                        group_ctx.tensor_names[tensor_idx],
+                        _tensor_sample_summary(source_state),
+                        _tensor_sample_summary(dest_state),
+                    )
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -1798,6 +1973,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         else:
             assert memory_obj.metadata.fmt == MemoryFormat.KV_2LTD
 
+        req_id = kwargs.get("req_id")
         slot_mappings_by_group = self._ensure_group_slot_mappings(
             kwargs, "VLLMPagedMemNPUConnectorV3.to_gpu"
         )
@@ -1816,11 +1992,13 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 memory_obj,
                 group_ctx,
                 slot_mapping[start:end],
+                req_id=req_id,
             )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         assert memory_obj.raw_tensor is not None
+        req_id = kwargs.get("req_id")
         slot_mappings_by_group = self._ensure_group_slot_mappings(
             kwargs, "VLLMPagedMemNPUConnectorV3.from_gpu"
         )
@@ -1840,6 +2018,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                     memory_obj,
                     group_ctx,
                     slot_mapping[start:end],
+                    req_id=req_id,
                 )
 
         if not memory_obj.raw_tensor.is_cuda:
