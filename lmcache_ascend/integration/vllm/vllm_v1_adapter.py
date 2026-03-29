@@ -9,6 +9,9 @@ from lmcache.integration.vllm.utils import ENGINE_NAME, mla_enabled
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     _calculate_draft_layers,
+    _stable_token_fingerprint,
+    _summarize_block_groups,
+    _summarize_int_sequence,
     need_gpu_interm_buffer,
 )
 from lmcache.logging import init_logger
@@ -51,6 +54,36 @@ elif _build_info.__framework_name__ == "mindspore":
     HAS_NPU_CONNECTOR_V3 = False
 
 logger = init_logger(__name__)
+
+
+def _summarize_tensor_values(tensor: torch.Tensor, limit: int = 6) -> str:
+    flat_values = tensor.detach().cpu().reshape(-1).tolist()
+    return _summarize_int_sequence(flat_values, limit)
+
+
+def _summarize_true_positions(mask: torch.Tensor, limit: int = 8) -> str:
+    true_positions = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+    return _summarize_int_sequence(true_positions, limit)
+
+
+def _build_external_load_request_summary(request) -> str:
+    load_spec = request.load_spec
+    assert load_spec is not None
+    token_ids = list(request.token_ids)
+    expected_load_tokens = (
+        load_spec.lmcache_cached_tokens - load_spec.vllm_cached_tokens
+    )
+    return (
+        f"req_id={request.req_id} "
+        f"prompt_tokens={len(token_ids)} "
+        f"prompt_fp={_stable_token_fingerprint(token_ids)} "
+        f"lmcache_cached_tokens={load_spec.lmcache_cached_tokens} "
+        f"vllm_cached_tokens={load_spec.vllm_cached_tokens} "
+        f"expected_load_tokens={expected_load_tokens} "
+        f"request_configs={request.request_configs} "
+        f"block_groups={_summarize_block_groups(request.allocated_block_ids_by_group)} "
+        f"token_summary={_summarize_int_sequence(token_ids)}"
+    )
 
 def _get_request_slot_mappings_on_device(
     self,
@@ -266,9 +299,27 @@ def start_load_kv(self, forward_context, **kwargs) -> None:
     assert len(self.kv_caches) > 0
     kvcaches = list(self.kv_caches.values())
 
+    load_requests = [
+        request for request in metadata.requests if request.load_spec is not None
+    ]
+
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
-        logger.debug("In connector.start_load_kv, but the attn_metadata is None")
+        if load_requests:
+            logger.error(
+                "External load aborted because attn_metadata is None. "
+                "forward_context_type=%s load_request_count=%d kv_cache_layers=%d",
+                type(forward_context).__name__,
+                len(load_requests),
+                len(kvcaches),
+            )
+            for request in load_requests:
+                logger.error(
+                    "Pending external load request summary: %s",
+                    _build_external_load_request_summary(request),
+                )
+        else:
+            logger.debug("In connector.start_load_kv, but the attn_metadata is None")
         return
 
     assert self.lmcache_engine is not None
@@ -302,6 +353,25 @@ def start_load_kv(self, forward_context, **kwargs) -> None:
         token_mask[:masked_token_count] = False
 
         lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+        num_expected_tokens = (
+            lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+        )
+        load_slice_tokens = list(tokens[masked_token_count:lmcache_cached_tokens])
+        slot_mapping_summaries = "; ".join(
+            (
+                f"group{group_idx}:"
+                f"{_summarize_tensor_values(slot_mapping[masked_token_count:lmcache_cached_tokens])}"
+            )
+            for group_idx, slot_mapping in enumerate(slot_mappings_by_group)
+        )
+        logger.info(
+            "External load start %s load_slice_fp=%s masked_token_count=%d "
+            "slot_mappings=%s",
+            _build_external_load_request_summary(request),
+            _stable_token_fingerprint(load_slice_tokens),
+            masked_token_count,
+            slot_mapping_summaries,
+        )
 
         if self.use_layerwise:
             slot_mapping = slot_mappings_by_group[0]
@@ -342,8 +412,34 @@ def start_load_kv(self, forward_context, **kwargs) -> None:
             )
 
             num_retrieved_tokens = ret_token_mask.sum().item()
-            num_expected_tokens = (
-                lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+            expected_load_mask = token_mask[:lmcache_cached_tokens]
+            ret_token_mask_cpu = ret_token_mask.detach().cpu()
+            expected_load_mask_cpu = expected_load_mask.detach().cpu()
+            missing_positions = torch.nonzero(
+                expected_load_mask_cpu & ~ret_token_mask_cpu,
+                as_tuple=False,
+            ).flatten()
+            unexpected_positions = torch.nonzero(
+                (~expected_load_mask_cpu) & ret_token_mask_cpu,
+                as_tuple=False,
+            ).flatten()
+            missing_token_ids = [
+                int(tokens[pos])
+                for pos in missing_positions[:8].tolist()
+            ]
+            logger.info(
+                "External load finish req_id=%s retrieved_tokens=%d "
+                "expected_tokens=%d retrieved_positions=%s "
+                "missing_positions=%s missing_token_ids=%s "
+                "unexpected_positions=%s retrieve_input_positions=%s",
+                request.req_id,
+                num_retrieved_tokens,
+                num_expected_tokens,
+                _summarize_true_positions(ret_token_mask_cpu),
+                _summarize_int_sequence(missing_positions.tolist()),
+                missing_token_ids,
+                _summarize_int_sequence(unexpected_positions.tolist()),
+                _summarize_true_positions(expected_load_mask_cpu),
             )
             if num_retrieved_tokens < num_expected_tokens:
                 logger.error(
@@ -356,6 +452,14 @@ def start_load_kv(self, forward_context, **kwargs) -> None:
                     "Num retrieved tokens: %d, num expected tokens: %d",
                     num_retrieved_tokens,
                     num_expected_tokens,
+                )
+                logger.error(
+                    "Failed external load details req_id=%s load_slice_fp=%s "
+                    "load_slice_tokens=%s slot_mappings=%s",
+                    request.req_id,
+                    _stable_token_fingerprint(load_slice_tokens),
+                    _summarize_int_sequence(load_slice_tokens),
+                    slot_mapping_summaries,
                 )
 
         self._stats_monitor.update_interval_vllm_hit_tokens(
