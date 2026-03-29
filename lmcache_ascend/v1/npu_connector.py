@@ -108,6 +108,14 @@ def _should_log_layer_position(layer_pos: int, total_layers: int) -> bool:
     return layer_pos == 0 or layer_pos == total_layers - 1
 
 
+def _cpu_select_rows(tensor: torch.Tensor, rows: list[int]) -> torch.Tensor:
+    cpu_tensor = tensor.detach().to("cpu")
+    if not rows:
+        return cpu_tensor.reshape(0, *cpu_tensor.shape[1:])
+    row_index = torch.tensor(rows, dtype=torch.long)
+    return cpu_tensor.index_select(0, row_index)
+
+
 def is_310p():
     global _IS_310P
     if _IS_310P is None:
@@ -1694,20 +1702,11 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             memory_obj_tensor[1, layer_pos].copy_(selected_v, non_blocking=True)
             if _should_log_layer_position(layer_pos, len(group_ctx.layer_indices)):
                 sampled_rows = _build_edge_indices(selected_k.shape[0], count=2)
-                sampled_row_tensor = torch.tensor(
-                    sampled_rows,
-                    dtype=torch.long,
-                    device=selected_k.device,
-                )
-                sampled_slots = slot_mapping.index_select(0, sampled_row_tensor)
-                sampled_source_k = selected_k.index_select(0, sampled_row_tensor)
-                sampled_source_v = selected_v.index_select(0, sampled_row_tensor)
-                sampled_dest_k = memory_obj_tensor[0, layer_pos].index_select(
-                    0, sampled_row_tensor
-                )
-                sampled_dest_v = memory_obj_tensor[1, layer_pos].index_select(
-                    0, sampled_row_tensor
-                )
+                sampled_slots = _cpu_select_rows(slot_mapping, sampled_rows)
+                sampled_source_k = _cpu_select_rows(selected_k, sampled_rows)
+                sampled_source_v = _cpu_select_rows(selected_v, sampled_rows)
+                sampled_dest_k = _cpu_select_rows(memory_obj_tensor[0, layer_pos], sampled_rows)
+                sampled_dest_v = _cpu_select_rows(memory_obj_tensor[1, layer_pos], sampled_rows)
                 logger.info(
                     "NPU V3 attention store sample req_id=%s group=%d layer_idx=%d "
                     "layer_pos=%d slot_rows=%s slot_values=%s source_k=%s "
@@ -1718,7 +1717,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                     layer_pos,
                     sampled_rows,
                     _summarize_int_values(
-                        [int(v) for v in sampled_slots.detach().cpu().tolist()]
+                        [int(v) for v in sampled_slots.tolist()]
                     ),
                     _tensor_sample_summary(sampled_source_k),
                     _tensor_sample_summary(sampled_dest_k),
@@ -1773,16 +1772,12 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             value_view.index_copy_(0, slot_mapping, source_v)
             if _should_log_layer_position(layer_pos, len(group_ctx.layer_indices)):
                 sampled_rows = _build_edge_indices(source_k.shape[0], count=2)
-                sampled_row_tensor = torch.tensor(
-                    sampled_rows,
-                    dtype=torch.long,
-                    device=source_k.device,
-                )
-                sampled_slots = slot_mapping.index_select(0, sampled_row_tensor)
-                sampled_source_k = source_k.index_select(0, sampled_row_tensor)
-                sampled_source_v = source_v.index_select(0, sampled_row_tensor)
-                sampled_dest_k = key_view.index_select(0, sampled_slots)
-                sampled_dest_v = value_view.index_select(0, sampled_slots)
+                sampled_slots = _cpu_select_rows(slot_mapping, sampled_rows)
+                sampled_source_k = _cpu_select_rows(source_k, sampled_rows)
+                sampled_source_v = _cpu_select_rows(source_v, sampled_rows)
+                sampled_slot_values = [int(v) for v in sampled_slots.tolist()]
+                sampled_dest_k = _cpu_select_rows(key_view, sampled_slot_values)
+                sampled_dest_v = _cpu_select_rows(value_view, sampled_slot_values)
                 logger.info(
                     "NPU V3 attention load sample req_id=%s group=%d layer_idx=%d "
                     "layer_pos=%d slot_rows=%s slot_values=%s source_k=%s "
@@ -1792,9 +1787,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                     layer_idx,
                     layer_pos,
                     sampled_rows,
-                    _summarize_int_values(
-                        [int(v) for v in sampled_slots.detach().cpu().tolist()]
-                    ),
+                    _summarize_int_values(sampled_slot_values),
                     _tensor_sample_summary(sampled_source_k),
                     _tensor_sample_summary(sampled_dest_k),
                     _tensor_sample_summary(sampled_source_v),
