@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 import hashlib
+import os
 from typing import Any, List, Optional, Set, Tuple, Union
 
 # Third Party
@@ -30,6 +31,12 @@ import lmcache_ascend.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 _IS_310P = None
+_ENABLE_TENSOR_SAMPLE_LOG = os.getenv("LMCACHE_TENSOR_SAMPLE_LOG", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _summarize_int_values(values: list[int], limit: int = 6) -> str:
@@ -106,6 +113,12 @@ def _tensor_sample_summary(
 
 def _should_log_layer_position(layer_pos: int, total_layers: int) -> bool:
     return layer_pos == 0 or layer_pos == total_layers - 1
+
+
+def _should_log_tensor_samples(layer_pos: int, total_layers: int) -> bool:
+    return _ENABLE_TENSOR_SAMPLE_LOG and _should_log_layer_position(
+        layer_pos, total_layers
+    )
 
 
 def _cpu_select_rows(tensor: torch.Tensor, rows: list[int]) -> torch.Tensor:
@@ -1700,7 +1713,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             selected_v = value_view.index_select(0, slot_mapping)
             memory_obj_tensor[0, layer_pos].copy_(selected_k, non_blocking=True)
             memory_obj_tensor[1, layer_pos].copy_(selected_v, non_blocking=True)
-            if _should_log_layer_position(layer_pos, len(group_ctx.layer_indices)):
+            if _should_log_tensor_samples(layer_pos, len(group_ctx.layer_indices)):
                 sampled_rows = _build_edge_indices(selected_k.shape[0], count=2)
                 sampled_slots = _cpu_select_rows(slot_mapping, sampled_rows)
                 sampled_source_k = _cpu_select_rows(selected_k, sampled_rows)
@@ -1770,7 +1783,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             )
             key_view.index_copy_(0, slot_mapping, source_k)
             value_view.index_copy_(0, slot_mapping, source_v)
-            if _should_log_layer_position(layer_pos, len(group_ctx.layer_indices)):
+            if _should_log_tensor_samples(layer_pos, len(group_ctx.layer_indices)):
                 sampled_rows = _build_edge_indices(source_k.shape[0], count=2)
                 sampled_slots = _cpu_select_rows(slot_mapping, sampled_rows)
                 sampled_source_k = _cpu_select_rows(source_k, sampled_rows)
@@ -1880,7 +1893,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 zip(group_memory_tensors, layer_cache, strict=True)
             ):
                 memory_tensor[layer_pos].copy_(state_tensor[block_id])
-                if _should_log_layer_position(layer_pos, len(group_kvcaches)):
+                if _should_log_tensor_samples(layer_pos, len(group_kvcaches)):
                     source_state = state_tensor[block_id]
                     dest_state = memory_tensor[layer_pos]
                     logger.info(
@@ -1940,7 +1953,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 strict=True,
             )):
                 state_tensor[block_id].copy_(memory_tensor[layer_pos])
-                if _should_log_layer_position(layer_pos, len(group_kvcaches)):
+                if _should_log_tensor_samples(layer_pos, len(group_kvcaches)):
                     source_state = memory_tensor[layer_pos]
                     dest_state = state_tensor[block_id]
                     logger.info(
