@@ -1676,14 +1676,11 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             value_tensor.reshape(-1, hidden_dim_size),
         )
 
-    def _copy_attention_group_from_gpu_python(
+    def _get_attention_group_transfer_tensor(
         self,
         memory_obj: MemoryObj,
         group_ctx: _NPUV3GroupContext,
-        slot_mapping: torch.Tensor,
-        req_id: Optional[str] = None,
-    ) -> None:
-        assert self.kvcaches is not None
+    ) -> torch.Tensor:
         memory_obj_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
         if len(memory_obj_tensors) != 1:
             raise ValueError(
@@ -1692,11 +1689,186 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             )
 
         memory_obj_tensor = memory_obj_tensors[0]
-        if memory_obj_tensor.shape[0] != 2:
+        if not self.use_mla and memory_obj_tensor.shape[0] != 2:
             raise ValueError(
                 f"Attention group {group_ctx.group_idx} expects KV_2LTD tensor with "
                 f"leading kv dim=2, got shape {tuple(memory_obj_tensor.shape)}."
             )
+        return memory_obj_tensor
+
+    def _run_attention_group_to_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if group_ctx.kv_cache_pointers_on_device is None:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} is missing KV cache pointers."
+            )
+        if group_ctx.page_buffer_size <= 0:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} has invalid page_buffer_size "
+                f"{group_ctx.page_buffer_size}."
+            )
+
+        memory_obj_tensor = self._get_attention_group_transfer_tensor(
+            memory_obj, group_ctx
+        )
+        slot_mapping = slot_mapping.to(
+            device=self.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+
+        expected_tokens = memory_obj_tensor.shape[2]
+        if slot_mapping.numel() != expected_tokens:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} expects {expected_tokens} "
+                f"slot mappings, got {slot_mapping.numel()}."
+            )
+
+        lmc_ops.multi_layer_kv_transfer(
+            memory_obj_tensor,
+            group_ctx.kv_cache_pointers_on_device,
+            slot_mapping,
+            self.device,
+            group_ctx.page_buffer_size,
+            False,
+            self.use_mla,
+            group_ctx.kv_format.value,
+        )
+
+    def _run_attention_group_from_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if group_ctx.kv_cache_pointers_on_device is None:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} is missing KV cache pointers."
+            )
+        if group_ctx.page_buffer_size <= 0:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} has invalid page_buffer_size "
+                f"{group_ctx.page_buffer_size}."
+            )
+
+        memory_obj_tensor = self._get_attention_group_transfer_tensor(
+            memory_obj, group_ctx
+        )
+        slot_mapping = slot_mapping.to(
+            device=self.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+
+        expected_tokens = memory_obj_tensor.shape[2]
+        if slot_mapping.numel() != expected_tokens:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} expects {expected_tokens} "
+                f"slot mappings, got {slot_mapping.numel()}."
+            )
+
+        can_use_fused = (
+            group_ctx.tmp_buffer is not None
+            and not memory_obj_tensor.is_cuda
+            and group_ctx.tmp_buffer.shape == memory_obj_tensor.shape
+        )
+
+        if can_use_fused:
+            lmc_ops.fused_multi_layer_kv_transfer(
+                memory_obj_tensor,
+                group_ctx.tmp_buffer,
+                group_ctx.kv_cache_pointers_on_device,
+                slot_mapping,
+                self.device,
+                group_ctx.page_buffer_size,
+                True,
+                self.use_mla,
+                group_ctx.kv_format.value,
+            )
+            return
+
+        lmc_ops.multi_layer_kv_transfer(
+            memory_obj_tensor,
+            group_ctx.kv_cache_pointers_on_device,
+            slot_mapping,
+            self.device,
+            group_ctx.page_buffer_size,
+            True,
+            self.use_mla,
+            group_ctx.kv_format.value,
+        )
+
+    def _copy_attention_group_from_gpu(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        slot_mapping: torch.Tensor,
+        req_id: Optional[str] = None,
+    ) -> None:
+        try:
+            self._run_attention_group_from_gpu_op(
+                memory_obj,
+                group_ctx,
+                slot_mapping,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Attention group operator store failed, falling back to Python copy. "
+                "req_id=%s group=%d error=%s",
+                req_id,
+                group_ctx.group_idx,
+                exc,
+            )
+            self._copy_attention_group_from_gpu_python(
+                memory_obj,
+                group_ctx,
+                slot_mapping,
+                req_id=req_id,
+            )
+
+    def _copy_attention_group_to_gpu(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        slot_mapping: torch.Tensor,
+        req_id: Optional[str] = None,
+    ) -> None:
+        try:
+            self._run_attention_group_to_gpu_op(
+                memory_obj,
+                group_ctx,
+                slot_mapping,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Attention group operator load failed, falling back to Python copy. "
+                "req_id=%s group=%d error=%s",
+                req_id,
+                group_ctx.group_idx,
+                exc,
+            )
+            self._copy_attention_group_to_gpu_python(
+                memory_obj,
+                group_ctx,
+                slot_mapping,
+                req_id=req_id,
+            )
+
+    def _copy_attention_group_from_gpu_python(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        slot_mapping: torch.Tensor,
+        req_id: Optional[str] = None,
+    ) -> None:
+        assert self.kvcaches is not None
+        memory_obj_tensor = self._get_attention_group_transfer_tensor(
+            memory_obj, group_ctx
+        )
 
         slot_mapping = slot_mapping.to(
             device=self.device,
@@ -1746,19 +1918,9 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         req_id: Optional[str] = None,
     ) -> None:
         assert self.kvcaches is not None
-        memory_obj_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
-        if len(memory_obj_tensors) != 1:
-            raise ValueError(
-                f"Attention group {group_ctx.group_idx} expects exactly one transfer "
-                f"tensor, got {len(memory_obj_tensors)}."
-            )
-
-        memory_obj_tensor = memory_obj_tensors[0]
-        if memory_obj_tensor.shape[0] != 2:
-            raise ValueError(
-                f"Attention group {group_ctx.group_idx} expects KV_2LTD tensor with "
-                f"leading kv dim=2, got shape {tuple(memory_obj_tensor.shape)}."
-            )
+        memory_obj_tensor = self._get_attention_group_transfer_tensor(
+            memory_obj, group_ctx
+        )
 
         slot_mapping = slot_mapping.to(
             device=self.device,
@@ -1861,12 +2023,17 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         **kwargs,
     ) -> None:
         assert self.kvcaches is not None
+
+        # 获得当前组所在的 blockid
         block_id = self._resolve_gdn_block_id(
             group_ctx,
             end,
             kwargs,
             "VLLMPagedMemNPUConnectorV3.from_gpu",
         )
+
+        # memory_tensor_conv.shape = [12, 3, 8192]
+        # memory_tensor_ssm.shape = [12, 32, 128, 128]
         group_memory_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
         if len(group_memory_tensors) != group_ctx.num_tensors:
             raise ValueError(
@@ -1874,6 +2041,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 f"but memory object exposes {len(group_memory_tensors)}."
             )
 
+        #获取当前组所有层的数据 当前 GDN group 的所有层的 runtime cache 列表 每个 layer_cache 对应这个 group 里的 一层
         group_kvcaches = [
             self.kvcaches[layer_idx]
             for layer_idx in group_ctx.layer_indices
@@ -1994,7 +2162,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             if group_ctx.kv_format == KVCacheFormat.GDN_ALIGN_STATE:
                 self._copy_gdn_group_to_gpu(memory_obj, group_ctx, end, **kwargs)
                 continue
-            self._copy_attention_group_to_gpu_python(
+            self._copy_attention_group_to_gpu(
                 memory_obj,
                 group_ctx,
                 slot_mapping[start:end],
@@ -2014,13 +2182,13 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         assert self.group_contexts is not None
 
         with torch.cuda.stream(self.store_stream):
-            for group_ctx, slot_mapping in zip(
+            for group_ctx, slot_mapping in zip( #按组进行遍历
                 self.group_contexts, slot_mappings_by_group, strict=True
             ):
                 if group_ctx.kv_format == KVCacheFormat.GDN_ALIGN_STATE:
                     self._copy_gdn_group_from_gpu(memory_obj, group_ctx, end, **kwargs)
                     continue
-                self._copy_attention_group_from_gpu_python(
+                self._copy_attention_group_from_gpu(
                     memory_obj,
                     group_ctx,
                     slot_mapping[start:end],
