@@ -530,16 +530,16 @@ def wait_for_save(self):
         if (
             save_spec is None or not save_spec.can_save
         ) and self.kv_role != "kv_producer":
-            logger.info(
-                "Ascend wait_for_save skipping req_id=%s save_spec_present=%s "
-                "can_save=%s kv_role=%s token_count=%d is_last_prefill=%s",
-                request.req_id,
-                save_spec is not None,
-                save_spec.can_save if save_spec is not None else False,
-                self.kv_role,
-                len(request.token_ids),
-                request.is_last_prefill,
-            )
+            # logger.info(
+            #     "Ascend wait_for_save skipping req_id=%s save_spec_present=%s "
+            #     "can_save=%s kv_role=%s token_count=%d is_last_prefill=%s",
+            #     request.req_id,
+            #     save_spec is not None,
+            #     save_spec.can_save if save_spec is not None else False,
+            #     self.kv_role,
+            #     len(request.token_ids),
+            #     request.is_last_prefill,
+            # )
             continue
 
         token_ids = request.token_ids
@@ -572,12 +572,12 @@ def wait_for_save(self):
         skip_leading_tokens = save_spec.skip_leading_tokens
 
         if skip_leading_tokens == len(token_ids):
-            logger.info(
-                "Ascend wait_for_save skipping req_id=%s because "
-                "skip_leading_tokens == len(token_ids) == %d",
-                request.req_id,
-                len(token_ids),
-            )
+            # logger.info(
+            #     "Ascend wait_for_save skipping req_id=%s because "
+            #     "skip_leading_tokens == len(token_ids) == %d",
+            #     request.req_id,
+            #     len(token_ids),
+            # )
             continue
         skip_leading_tokens = (
             skip_leading_tokens // self._lmcache_chunk_size * self._lmcache_chunk_size
