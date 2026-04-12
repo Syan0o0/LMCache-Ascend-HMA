@@ -498,14 +498,14 @@ def wait_for_save(self):
             f"skip_leading_tokens={skip_leading_tokens},"
             f"is_last_prefill={request.is_last_prefill}"
         )
-    logger.info(
-        "Ascend wait_for_save entered request_count=%d kv_role=%s "
-        "use_layerwise=%s requests=[%s]",
-        len(connector_metadata.requests),
-        self.kv_role,
-        self.use_layerwise,
-        "; ".join(request_summaries),
-    )
+    # logger.info(
+    #     "Ascend wait_for_save entered request_count=%d kv_role=%s "
+    #     "use_layerwise=%s requests=[%s]",
+    #     len(connector_metadata.requests),
+    #     self.kv_role,
+    #     self.use_layerwise,
+    #     "; ".join(request_summaries),
+    # )
 
     if self.kv_role == "kv_consumer":
         return
