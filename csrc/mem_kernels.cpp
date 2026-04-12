@@ -2,6 +2,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "utils.h"
 #include <ATen/ATen.h>
+#include <cstdint>
 #include <Python.h>
 #include <pybind11/pybind11.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -84,8 +85,9 @@ torch::Tensor build_gdn_state_ptr_tensor_on_device(
 
   for (size_t layer_pos = 0; layer_pos < family_state_tensors.size();
        ++layer_pos) {
-    state_ptrs_cpu_data[layer_pos] =
-        static_cast<int64_t>(family_state_tensors[layer_pos].data_ptr());
+    const auto raw_ptr = reinterpret_cast<uintptr_t>(
+        family_state_tensors[layer_pos].data_ptr());
+    state_ptrs_cpu_data[layer_pos] = static_cast<int64_t>(raw_ptr);
   }
 
   return state_ptrs_cpu.to(runtime_device);
