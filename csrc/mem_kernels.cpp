@@ -10,6 +10,124 @@
 
 namespace py = pybind11;
 
+namespace {
+
+void validate_gdn_memory_tensor(const torch::Tensor &memory_tensor,
+                                const at::ScalarType expected_dtype,
+                                const char *tensor_name) {
+  TORCH_CHECK(memory_tensor.defined(),
+              "GDN memory tensor for ", tensor_name, " must be defined.");
+  TORCH_CHECK(memory_tensor.dim() >= 2,
+              "GDN memory tensor for ", tensor_name,
+              " must have at least 2 dims, got ", memory_tensor.dim(), ".");
+  TORCH_CHECK(memory_tensor.scalar_type() == expected_dtype,
+              "GDN memory tensor dtype mismatch for ", tensor_name,
+              ". Expected ", expected_dtype, ", got ",
+              memory_tensor.scalar_type(), ".");
+  TORCH_CHECK(memory_tensor.is_contiguous(),
+              "GDN memory tensor for ", tensor_name,
+              " must be contiguous in phase 1.");
+}
+
+void validate_gdn_state_tensor(const torch::Tensor &state_tensor,
+                               const at::ScalarType expected_dtype,
+                               const torch::Tensor &memory_tensor,
+                               const char *tensor_name, const int64_t layer_pos) {
+  TORCH_CHECK(state_tensor.defined(), "GDN runtime tensor for ", tensor_name,
+              " at layer ", layer_pos, " must be defined.");
+  TORCH_CHECK(
+      state_tensor.dim() == memory_tensor.dim() + 1,
+      "GDN runtime tensor rank mismatch for ", tensor_name, " at layer ",
+      layer_pos, ". Runtime rank should be transfer rank + 1, got runtime rank ",
+      state_tensor.dim(), " and transfer rank ", memory_tensor.dim(), ".");
+  TORCH_CHECK(state_tensor.scalar_type() == expected_dtype,
+              "GDN runtime tensor dtype mismatch for ", tensor_name,
+              " at layer ", layer_pos, ". Expected ", expected_dtype,
+              ", got ", state_tensor.scalar_type(), ".");
+  TORCH_CHECK(state_tensor.is_contiguous(), "GDN runtime tensor for ",
+              tensor_name, " at layer ", layer_pos,
+              " must be contiguous in phase 1.");
+
+  for (int64_t dim = 1; dim < state_tensor.dim(); ++dim) {
+    TORCH_CHECK(
+        state_tensor.size(dim) == memory_tensor.size(dim - 1),
+        "GDN runtime tensor tail shape mismatch for ", tensor_name,
+        " at layer ", layer_pos, ". Runtime dim ", dim, " = ",
+      state_tensor.size(dim), ", transfer dim ", dim - 1, " = ",
+      memory_tensor.size(dim - 1), ".");
+  }
+}
+
+int64_t compute_gdn_slice_numel(const torch::Tensor &memory_tensor,
+                                const char *tensor_name) {
+  TORCH_CHECK(memory_tensor.dim() >= 2,
+              "GDN memory tensor for ", tensor_name,
+              " must have at least 2 dims.");
+  TORCH_CHECK(memory_tensor.size(0) > 0,
+              "GDN memory tensor for ", tensor_name,
+              " must have num_layers > 0.");
+  TORCH_CHECK(memory_tensor.numel() % memory_tensor.size(0) == 0,
+              "GDN memory tensor for ", tensor_name,
+              " must be divisible by num_layers.");
+  return memory_tensor.numel() / memory_tensor.size(0);
+}
+
+torch::Tensor build_gdn_state_ptr_tensor_on_device(
+    const std::vector<torch::Tensor> &family_state_tensors,
+    const torch::Device &runtime_device) {
+  auto cpu_options =
+      torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+  auto state_ptrs_cpu =
+      torch::empty({static_cast<int64_t>(family_state_tensors.size())},
+                   cpu_options);
+  auto *state_ptrs_cpu_data = state_ptrs_cpu.data_ptr<int64_t>();
+
+  for (size_t layer_pos = 0; layer_pos < family_state_tensors.size();
+       ++layer_pos) {
+    state_ptrs_cpu_data[layer_pos] =
+        static_cast<int64_t>(family_state_tensors[layer_pos].data_ptr());
+  }
+
+  return state_ptrs_cpu.to(runtime_device);
+}
+
+void run_single_gdn_tensor_family_transfer(
+    torch::Tensor &memory_tensor,
+    const std::vector<torch::Tensor> &family_state_tensors,
+    const int64_t block_id, const bool direction, const char *tensor_name) {
+  TORCH_CHECK(!family_state_tensors.empty(),
+              "GDN runtime tensor family ", tensor_name, " must not be empty.");
+
+  const auto runtime_device = family_state_tensors[0].device();
+  const auto num_layers = static_cast<int32_t>(family_state_tensors.size());
+  const auto slice_numel = compute_gdn_slice_numel(memory_tensor, tensor_name);
+
+  auto state_ptrs_on_device =
+      build_gdn_state_ptr_tensor_on_device(family_state_tensors, runtime_device);
+  auto config = prepare_gdn_state_transfer_config(
+      memory_tensor, runtime_device, num_layers, slice_numel, direction);
+
+  uint8_t *memory_tensor_ptr = get_kernel_ptr<uint8_t, torch::Tensor>(memory_tensor);
+  uint8_t *state_ptrs_ptr =
+      get_kernel_ptr<uint8_t, torch::Tensor>(state_ptrs_on_device);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("multi_layer_gdn_state_transfer_kernel");
+  cmd.SetCustomHandler([config, memory_tensor_ptr, state_ptrs_ptr, block_id,
+                        state_ptrs_on_device]() -> int {
+    (void)state_ptrs_on_device;
+    auto dtype_num = vllm_ascend::get_dtype_from_torch(config.scalar_type);
+    kvcache_ops::multi_layer_gdn_state_transfer_kernel(
+        dtype_num, config.aiv_num, config.stream, memory_tensor_ptr,
+        state_ptrs_ptr, block_id, config.num_layers, config.slice_numel,
+        config.direction);
+    return 0;
+  });
+  cmd.Run();
+}
+
+} // namespace
+
 /**
  * Quickly offload KV cache from vLLM paged memory to the offloading buffer
  * Processes all the layers at the same time
@@ -136,6 +254,76 @@ void fused_multi_layer_kv_transfer(
   });
   cmd.Run();
   return;
+}
+
+void multi_layer_gdn_state_transfer(
+    std::vector<torch::Tensor> &memory_tensors,
+    std::vector<torch::Tensor> &state_tensors, const int64_t block_id,
+    const bool direction) {
+  TORCH_CHECK(memory_tensors.size() == 2,
+              "First-version multi_layer_gdn_state_transfer expects exactly 2 "
+              "memory tensors, got ",
+              memory_tensors.size(), ".");
+  TORCH_CHECK(!state_tensors.empty(),
+              "multi_layer_gdn_state_transfer requires non-empty state_tensors.");
+
+  auto &conv_memory_tensor = memory_tensors[0];
+  auto &ssm_memory_tensor = memory_tensors[1];
+  validate_gdn_memory_tensor(conv_memory_tensor, at::kBFloat16, "conv_state");
+  validate_gdn_memory_tensor(ssm_memory_tensor, at::kFloat, "ssm_state");
+
+  const int64_t num_layers = conv_memory_tensor.size(0);
+  TORCH_CHECK(ssm_memory_tensor.size(0) == num_layers,
+              "GDN memory tensors must agree on num_layers. conv_state has ",
+              num_layers, ", ssm_state has ", ssm_memory_tensor.size(0), ".");
+  TORCH_CHECK(num_layers > 0,
+              "multi_layer_gdn_state_transfer requires num_layers > 0.");
+  TORCH_CHECK(state_tensors.size() == static_cast<size_t>(num_layers * 2),
+              "First-version multi_layer_gdn_state_transfer expects ",
+              num_layers * 2, " runtime state tensors, got ",
+              state_tensors.size(), ".");
+  TORCH_CHECK(block_id >= 0,
+              "multi_layer_gdn_state_transfer requires block_id >= 0, got ",
+              block_id, ".");
+  const auto runtime_device = state_tensors[0].device();
+
+  for (int64_t layer_pos = 0; layer_pos < num_layers; ++layer_pos) {
+    auto &conv_state_tensor = state_tensors[layer_pos];
+    auto &ssm_state_tensor = state_tensors[num_layers + layer_pos];
+
+    TORCH_CHECK(conv_state_tensor.device() == runtime_device,
+                "All conv_state runtime tensors must live on the same device.");
+    TORCH_CHECK(ssm_state_tensor.device() == runtime_device,
+                "All ssm_state runtime tensors must live on the same device.");
+
+    validate_gdn_state_tensor(conv_state_tensor, at::kBFloat16,
+                              conv_memory_tensor, "conv_state", layer_pos);
+    validate_gdn_state_tensor(ssm_state_tensor, at::kFloat, ssm_memory_tensor,
+                              "ssm_state", layer_pos);
+
+    TORCH_CHECK(block_id < conv_state_tensor.size(0),
+                "block_id ", block_id,
+                " is out of range for conv_state runtime tensor at layer ",
+                layer_pos, " with block dim ", conv_state_tensor.size(0), ".");
+    TORCH_CHECK(block_id < ssm_state_tensor.size(0),
+                "block_id ", block_id,
+                " is out of range for ssm_state runtime tensor at layer ",
+                layer_pos, " with block dim ", ssm_state_tensor.size(0), ".");
+  }
+
+  std::vector<torch::Tensor> conv_state_tensors;
+  std::vector<torch::Tensor> ssm_state_tensors;
+  conv_state_tensors.reserve(num_layers);
+  ssm_state_tensors.reserve(num_layers);
+  for (int64_t layer_pos = 0; layer_pos < num_layers; ++layer_pos) {
+    conv_state_tensors.push_back(state_tensors[layer_pos]);
+    ssm_state_tensors.push_back(state_tensors[num_layers + layer_pos]);
+  }
+
+  run_single_gdn_tensor_family_transfer(conv_memory_tensor, conv_state_tensors,
+                                        block_id, direction, "conv_state");
+  run_single_gdn_tensor_family_transfer(ssm_memory_tensor, ssm_state_tensors,
+                                        block_id, direction, "ssm_state");
 }
 
 void multi_layer_kv_transfer_310p(

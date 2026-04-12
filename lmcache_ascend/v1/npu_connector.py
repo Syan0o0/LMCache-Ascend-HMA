@@ -1376,6 +1376,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         ] = None
         self.group_contexts: Optional[List[_NPUV3GroupContext]] = None
         self.init = False
+        self._gdn_op_unavailable_warned = False
 
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
@@ -2015,7 +2016,204 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             )
         return group_block_ids[state_block_index]
 
-    def _copy_gdn_group_from_gpu(
+    def _collect_gdn_group_runtime_state_tensors(
+        self,
+        group_ctx: _NPUV3GroupContext,
+    ) -> List[torch.Tensor]:
+        assert self.kvcaches is not None
+
+        group_kvcaches = [
+            self.kvcaches[layer_idx]
+            for layer_idx in group_ctx.layer_indices
+        ]
+
+        collected_state_tensors: List[torch.Tensor] = []
+        for tensor_idx in range(group_ctx.num_tensors):
+            for layer_pos, layer_cache in enumerate(group_kvcaches):
+                if not isinstance(layer_cache, (tuple, list)):
+                    raise ValueError(
+                        f"GDN group {group_ctx.group_idx} expects per-layer state tensors, "
+                        f"got {type(layer_cache)}."
+                    )
+                if len(layer_cache) != group_ctx.num_tensors:
+                    raise ValueError(
+                        f"GDN group {group_ctx.group_idx} expects {group_ctx.num_tensors} "
+                        f"runtime tensors, got {len(layer_cache)}."
+                    )
+
+                state_tensor = layer_cache[tensor_idx]
+                if not isinstance(state_tensor, torch.Tensor):
+                    raise ValueError(
+                        f"GDN group {group_ctx.group_idx} expects runtime tensor, "
+                        f"got {type(state_tensor)} at layer_pos={layer_pos}, "
+                        f"tensor_idx={tensor_idx}."
+                    )
+                collected_state_tensors.append(state_tensor)
+
+        return collected_state_tensors
+
+    def _validate_qwen3_5_gdn_group_contract(
+        self,
+        group_ctx: _NPUV3GroupContext,
+        memory_tensors: List[torch.Tensor],
+        state_tensors: List[torch.Tensor],
+    ) -> None:
+        if group_ctx.group_kind != "gdn":
+            raise ValueError(
+                f"GDN operator path requires group_kind='gdn', got {group_ctx.group_kind}."
+            )
+        if group_ctx.kv_format != KVCacheFormat.GDN_ALIGN_STATE:
+            raise ValueError(
+                f"GDN operator path requires kv_format=GDN_ALIGN_STATE, "
+                f"got {group_ctx.kv_format.name}."
+            )
+        if group_ctx.num_tensors != 2:
+            raise ValueError(
+                f"First-version GDN operator only supports 2 tensors, "
+                f"got {group_ctx.num_tensors}."
+            )
+        if group_ctx.tensor_names != ["conv_state", "ssm_state"]:
+            raise ValueError(
+                "First-version GDN operator only supports tensor_names="
+                "['conv_state', 'ssm_state'], got "
+                f"{group_ctx.tensor_names}."
+            )
+        if len(memory_tensors) != 2:
+            raise ValueError(
+                f"First-version GDN operator expects 2 memory tensors, "
+                f"got {len(memory_tensors)}."
+            )
+
+        num_layers = group_ctx.num_layers
+        expected_state_tensor_count = num_layers * 2
+        if len(state_tensors) != expected_state_tensor_count:
+            raise ValueError(
+                f"First-version GDN operator expects {expected_state_tensor_count} "
+                f"runtime state tensors, got {len(state_tensors)}."
+            )
+
+        conv_memory_tensor, ssm_memory_tensor = memory_tensors
+        if not isinstance(conv_memory_tensor, torch.Tensor) or not isinstance(
+            ssm_memory_tensor, torch.Tensor
+        ):
+            raise ValueError("GDN operator path expects memory tensors to be torch.Tensor.")
+
+        if conv_memory_tensor.dtype != torch.bfloat16:
+            raise ValueError(
+                "First-version GDN operator expects conv_state memory tensor dtype "
+                f"torch.bfloat16, got {conv_memory_tensor.dtype}."
+            )
+        if ssm_memory_tensor.dtype != torch.float32:
+            raise ValueError(
+                "First-version GDN operator expects ssm_state memory tensor dtype "
+                f"torch.float32, got {ssm_memory_tensor.dtype}."
+            )
+
+        if conv_memory_tensor.shape[0] != num_layers:
+            raise ValueError(
+                f"conv_state memory tensor expects first dim {num_layers}, "
+                f"got {conv_memory_tensor.shape[0]}."
+            )
+        if ssm_memory_tensor.shape[0] != num_layers:
+            raise ValueError(
+                f"ssm_state memory tensor expects first dim {num_layers}, "
+                f"got {ssm_memory_tensor.shape[0]}."
+            )
+
+        conv_state_tensors = state_tensors[:num_layers]
+        ssm_state_tensors = state_tensors[num_layers:]
+
+        for layer_pos, state_tensor in enumerate(conv_state_tensors):
+            if state_tensor.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"conv_state runtime tensor at layer_pos={layer_pos} expects "
+                    f"torch.bfloat16, got {state_tensor.dtype}."
+                )
+            if tuple(state_tensor.shape[1:]) != tuple(conv_memory_tensor.shape[1:]):
+                raise ValueError(
+                    f"conv_state runtime tensor tail shape {tuple(state_tensor.shape[1:])} "
+                    f"does not match transfer tail shape {tuple(conv_memory_tensor.shape[1:])}."
+                )
+
+        for layer_pos, state_tensor in enumerate(ssm_state_tensors):
+            if state_tensor.dtype != torch.float32:
+                raise ValueError(
+                    f"ssm_state runtime tensor at layer_pos={layer_pos} expects "
+                    f"torch.float32, got {state_tensor.dtype}."
+                )
+            if tuple(state_tensor.shape[1:]) != tuple(ssm_memory_tensor.shape[1:]):
+                raise ValueError(
+                    f"ssm_state runtime tensor tail shape {tuple(state_tensor.shape[1:])} "
+                    f"does not match transfer tail shape {tuple(ssm_memory_tensor.shape[1:])}."
+                )
+
+    def _run_gdn_group_from_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        end: int,
+        **kwargs,
+    ) -> None:
+        if not hasattr(lmc_ops, "multi_layer_gdn_state_transfer"):
+            raise NotImplementedError(
+                "multi_layer_gdn_state_transfer is not available in lmcache_ascend.c_ops."
+            )
+
+        block_id = self._resolve_gdn_block_id(
+            group_ctx,
+            end,
+            kwargs,
+            "VLLMPagedMemNPUConnectorV3.from_gpu",
+        )
+        group_memory_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
+        state_tensors = self._collect_gdn_group_runtime_state_tensors(group_ctx)
+        self._validate_qwen3_5_gdn_group_contract(
+            group_ctx,
+            group_memory_tensors,
+            state_tensors,
+        )
+
+        lmc_ops.multi_layer_gdn_state_transfer(
+            group_memory_tensors,
+            state_tensors,
+            block_id,
+            True,
+        )
+
+    def _run_gdn_group_to_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        end: int,
+        **kwargs,
+    ) -> None:
+        if not hasattr(lmc_ops, "multi_layer_gdn_state_transfer"):
+            raise NotImplementedError(
+                "multi_layer_gdn_state_transfer is not available in lmcache_ascend.c_ops."
+            )
+
+        block_id = self._resolve_gdn_block_id(
+            group_ctx,
+            end,
+            kwargs,
+            "VLLMPagedMemNPUConnectorV3.to_gpu",
+        )
+        group_memory_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
+        state_tensors = self._collect_gdn_group_runtime_state_tensors(group_ctx)
+        self._validate_qwen3_5_gdn_group_contract(
+            group_ctx,
+            group_memory_tensors,
+            state_tensors,
+        )
+
+        lmc_ops.multi_layer_gdn_state_transfer(
+            group_memory_tensors,
+            state_tensors,
+            block_id,
+            False,
+        )
+
+    def _copy_gdn_group_from_gpu_python(
         self,
         memory_obj: MemoryObj,
         group_ctx: _NPUV3GroupContext,
@@ -2079,7 +2277,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                         _tensor_sample_summary(dest_state),
                     )
 
-    def _copy_gdn_group_to_gpu(
+    def _copy_gdn_group_to_gpu_python(
         self,
         memory_obj: MemoryObj,
         group_ctx: _NPUV3GroupContext,
@@ -2138,6 +2336,98 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                         _tensor_sample_summary(source_state),
                         _tensor_sample_summary(dest_state),
                     )
+
+    def _copy_gdn_group_from_gpu(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        end: int,
+        **kwargs,
+    ) -> None:
+        req_id = kwargs.get("req_id")
+        try:
+            self._run_gdn_group_from_gpu_op(
+                memory_obj,
+                group_ctx,
+                end,
+                **kwargs,
+            )
+        except NotImplementedError as exc:
+            if not self._gdn_op_unavailable_warned:
+                logger.warning(
+                    "GDN operator path is unavailable, falling back to Python copy. "
+                    "req_id=%s group=%d error=%s",
+                    req_id,
+                    group_ctx.group_idx,
+                    exc,
+                )
+                self._gdn_op_unavailable_warned = True
+            self._copy_gdn_group_from_gpu_python(
+                memory_obj,
+                group_ctx,
+                end,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "GDN operator store failed, falling back to Python copy. "
+                "req_id=%s group=%d error=%s",
+                req_id,
+                group_ctx.group_idx,
+                exc,
+            )
+            self._copy_gdn_group_from_gpu_python(
+                memory_obj,
+                group_ctx,
+                end,
+                **kwargs,
+            )
+
+    def _copy_gdn_group_to_gpu(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        end: int,
+        **kwargs,
+    ) -> None:
+        req_id = kwargs.get("req_id")
+        try:
+            self._run_gdn_group_to_gpu_op(
+                memory_obj,
+                group_ctx,
+                end,
+                **kwargs,
+            )
+        except NotImplementedError as exc:
+            if not self._gdn_op_unavailable_warned:
+                logger.warning(
+                    "GDN operator path is unavailable, falling back to Python copy. "
+                    "req_id=%s group=%d error=%s",
+                    req_id,
+                    group_ctx.group_idx,
+                    exc,
+                )
+                self._gdn_op_unavailable_warned = True
+            self._copy_gdn_group_to_gpu_python(
+                memory_obj,
+                group_ctx,
+                end,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "GDN operator load failed, falling back to Python copy. "
+                "req_id=%s group=%d error=%s",
+                req_id,
+                group_ctx.group_idx,
+                exc,
+            )
+            self._copy_gdn_group_to_gpu_python(
+                memory_obj,
+                group_ctx,
+                end,
+                **kwargs,
+            )
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):

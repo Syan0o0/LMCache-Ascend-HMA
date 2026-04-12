@@ -1,4 +1,4 @@
 [submodule "third_party/kvcache-ops"]
 	path = third_party/kvcache-ops
-	url = https://atomgit.com/openeuler/kvcache-ops.git
-
+	url = https://gitcode.com/syan0o0/kvcache-ops.git
+	branch = adapt_hma

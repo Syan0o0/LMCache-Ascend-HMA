@@ -116,6 +116,26 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
   config.singlePerLoopBuffer = totalPerLoopBuffer / numBuffsOnDev;
 }
 
+GDNStateTransferConfig
+prepare_gdn_state_transfer_config(const torch::Tensor &memory_tensor,
+                                  const torch::Device &runtime_device,
+                                  int32_t num_layers, int64_t slice_numel,
+                                  bool direction) {
+  GDNStateTransferConfig config;
+
+  const c10::OptionalDeviceGuard device_guard(runtime_device);
+
+  config.stream = c10_npu::getCurrentNPUStream().stream();
+  config.scalar_type = memory_tensor.scalar_type();
+  config.socName = aclrtGetSocName();
+  config.aiv_num = static_cast<uint32_t>(std::min(num_layers, 4));
+  config.num_layers = num_layers;
+  config.slice_numel = slice_numel;
+  config.direction = direction;
+
+  return config;
+}
+
 void compute_single_layer_ub_params(const KVTransferDims &dims,
                                     KVTransferUBParams &ub_params,
                                     const torch::Tensor &vllm_cache) {
