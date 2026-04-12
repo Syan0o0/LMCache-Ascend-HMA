@@ -37,9 +37,9 @@ void validate_gdn_state_tensor(const torch::Tensor &state_tensor,
   TORCH_CHECK(state_tensor.defined(), "GDN runtime tensor for ", tensor_name,
               " at layer ", layer_pos, " must be defined.");
   TORCH_CHECK(
-      state_tensor.dim() == memory_tensor.dim() + 1,
+      state_tensor.dim() == memory_tensor.dim(),
       "GDN runtime tensor rank mismatch for ", tensor_name, " at layer ",
-      layer_pos, ". Runtime rank should be transfer rank + 1, got runtime rank ",
+      layer_pos, ". Runtime rank should equal transfer rank, got runtime rank ",
       state_tensor.dim(), " and transfer rank ", memory_tensor.dim(), ".");
   TORCH_CHECK(state_tensor.scalar_type() == expected_dtype,
               "GDN runtime tensor dtype mismatch for ", tensor_name,
@@ -51,11 +51,11 @@ void validate_gdn_state_tensor(const torch::Tensor &state_tensor,
 
   for (int64_t dim = 1; dim < state_tensor.dim(); ++dim) {
     TORCH_CHECK(
-        state_tensor.size(dim) == memory_tensor.size(dim - 1),
+        state_tensor.size(dim) == memory_tensor.size(dim),
         "GDN runtime tensor tail shape mismatch for ", tensor_name,
         " at layer ", layer_pos, ". Runtime dim ", dim, " = ",
-      state_tensor.size(dim), ", transfer dim ", dim - 1, " = ",
-      memory_tensor.size(dim - 1), ".");
+        state_tensor.size(dim), ", transfer dim ", dim, " = ",
+        memory_tensor.size(dim), ".");
   }
 }
 
