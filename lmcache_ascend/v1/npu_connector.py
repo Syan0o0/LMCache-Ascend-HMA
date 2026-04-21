@@ -37,6 +37,14 @@ _ENABLE_TENSOR_SAMPLE_LOG = os.getenv("LMCACHE_TENSOR_SAMPLE_LOG", "").lower() i
     "yes",
     "on",
 }
+_GDN_ALIGN_LOAD_LAST_ONLY = os.getenv(
+    "LMCACHE_GDN_ALIGN_LOAD_LAST_ONLY", "1"
+).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _summarize_int_values(values: list[int], limit: int = 6) -> str:
@@ -2391,6 +2399,22 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         **kwargs,
     ) -> None:
         req_id = kwargs.get("req_id")
+        gdn_align_last_end = kwargs.get("gdn_align_last_end")
+        if (
+            _GDN_ALIGN_LOAD_LAST_ONLY
+            and group_ctx.kv_format == KVCacheFormat.GDN_ALIGN_STATE
+            and gdn_align_last_end is not None
+            and end != gdn_align_last_end
+        ):
+            logger.info(
+                "Skip GDN align load for non-last chunk req_id=%s group=%d "
+                "end=%d last_end=%d",
+                req_id,
+                group_ctx.group_idx,
+                end,
+                gdn_align_last_end,
+            )
+            return
         try:
             self._run_gdn_group_to_gpu_op(
                 memory_obj,
@@ -2501,6 +2525,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 "ProxyMemoryObj / remote batched_to_gpu."
             )
 
+        gdn_align_last_end = max(ends) if ends else None
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(
@@ -2508,10 +2533,15 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                     start,
                     end,
                     slot_mappings_by_group=slot_mappings_by_group,
+                    gdn_align_last_end=gdn_align_last_end,
                     **{
                         k: v
                         for k, v in kwargs.items()
-                        if k not in ("slot_mappings_by_group", "slot_mapping")
+                        if k not in (
+                            "slot_mappings_by_group",
+                            "slot_mapping",
+                            "gdn_align_last_end",
+                        )
                     },
                 )
         self.load_stream.synchronize()
