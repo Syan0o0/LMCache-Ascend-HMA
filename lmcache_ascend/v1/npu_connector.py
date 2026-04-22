@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 import hashlib
 import os
+import time
 from typing import Any, List, Optional, Set, Tuple, Union
 
 # Third Party
@@ -39,6 +40,22 @@ _ENABLE_TENSOR_SAMPLE_LOG = os.getenv("LMCACHE_TENSOR_SAMPLE_LOG", "").lower() i
 }
 _GDN_ALIGN_LOAD_LAST_ONLY = os.getenv(
     "LMCACHE_GDN_ALIGN_LOAD_LAST_ONLY", "1"
+).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_GDN_ALIGN_STORE_DEBUG_LOG = os.getenv(
+    "LMCACHE_GDN_ALIGN_STORE_DEBUG_LOG", "1"
+).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_GDN_ALIGN_LOAD_DEBUG_LOG = os.getenv(
+    "LMCACHE_GDN_ALIGN_LOAD_DEBUG_LOG", "1"
 ).lower() in {
     "1",
     "true",
@@ -2353,6 +2370,40 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         **kwargs,
     ) -> None:
         req_id = kwargs.get("req_id")
+        gdn_align_store_last_end = kwargs.get("gdn_align_store_last_end")
+        if (
+            _GDN_ALIGN_STORE_DEBUG_LOG
+            and group_ctx.kv_format == KVCacheFormat.GDN_ALIGN_STATE
+            and gdn_align_store_last_end is not None
+            and end == gdn_align_store_last_end
+        ):
+            caller_name = "VLLMPagedMemNPUConnectorV3._copy_gdn_group_from_gpu"
+            state_block_index = self._get_gdn_state_block_index(
+                end,
+                group_ctx.block_size,
+                caller_name,
+            )
+            block_id = self._resolve_gdn_block_id(
+                group_ctx,
+                end,
+                kwargs,
+                caller_name,
+            )
+            block_ids_by_group = _get_block_ids_by_group_from_kwargs(
+                kwargs,
+                caller_name,
+            )
+            group_block_ids = block_ids_by_group[group_ctx.group_idx]
+            logger.info(
+                "GDN align store block req_id=%s group=%d end=%d "
+                "state_block_index=%d block_id=%d block_groups_tail=%s",
+                req_id,
+                group_ctx.group_idx,
+                end,
+                state_block_index,
+                block_id,
+                _summarize_int_values(group_block_ids[-6:], limit=6),
+            )
         try:
             self._run_gdn_group_from_gpu_op(
                 memory_obj,
@@ -2406,15 +2457,41 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             and gdn_align_last_end is not None
             and end != gdn_align_last_end
         ):
+            return
+        if (
+            _GDN_ALIGN_LOAD_DEBUG_LOG
+            and group_ctx.kv_format == KVCacheFormat.GDN_ALIGN_STATE
+            and gdn_align_last_end is not None
+            and end == gdn_align_last_end
+        ):
+            caller_name = "VLLMPagedMemNPUConnectorV3._copy_gdn_group_to_gpu"
+            state_block_index = self._get_gdn_state_block_index(
+                end,
+                group_ctx.block_size,
+                caller_name,
+            )
+            block_id = self._resolve_gdn_block_id(
+                group_ctx,
+                end,
+                kwargs,
+                caller_name,
+            )
+            block_ids_by_group = _get_block_ids_by_group_from_kwargs(
+                kwargs,
+                caller_name,
+            )
+            group_block_ids = block_ids_by_group[group_ctx.group_idx]
             logger.info(
-                "Skip GDN align load for non-last chunk req_id=%s group=%d "
-                "end=%d last_end=%d",
+                "GDN align load block ts_ns=%d req_id=%s group=%d end=%d "
+                "state_block_index=%d block_id=%d block_groups_tail=%s",
+                time.time_ns(),
                 req_id,
                 group_ctx.group_idx,
                 end,
-                gdn_align_last_end,
+                state_block_index,
+                block_id,
+                _summarize_int_values(group_block_ids[-6:], limit=6),
             )
-            return
         try:
             self._run_gdn_group_to_gpu_op(
                 memory_obj,
@@ -2550,16 +2627,22 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
         slot_mappings_by_group = self._ensure_group_slot_mappings(
             kwargs, "VLLMPagedMemNPUConnectorV3.batched_from_gpu"
         )
+        gdn_align_store_last_end = max(ends) if ends else None
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(
                 memory_obj,
                 start,
                 end,
                 slot_mappings_by_group=slot_mappings_by_group,
+                gdn_align_store_last_end=gdn_align_store_last_end,
                 **{
                     k: v
                     for k, v in kwargs.items()
-                    if k not in ("slot_mappings_by_group", "slot_mapping")
+                    if k not in (
+                        "slot_mappings_by_group",
+                        "slot_mapping",
+                        "gdn_align_store_last_end",
+                    )
                 },
             )
 

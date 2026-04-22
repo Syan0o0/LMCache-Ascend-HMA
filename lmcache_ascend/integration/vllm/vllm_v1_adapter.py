@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import time
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -365,8 +366,9 @@ def start_load_kv(self, forward_context, **kwargs) -> None:
             for group_idx, slot_mapping in enumerate(slot_mappings_by_group)
         )
         logger.info(
-            "External load start %s load_slice_fp=%s masked_token_count=%d "
+            "External load start ts_ns=%d %s load_slice_fp=%s masked_token_count=%d "
             "slot_mappings=%s",
+            time.time_ns(),
             _build_external_load_request_summary(request),
             _stable_token_fingerprint(load_slice_tokens),
             masked_token_count,
