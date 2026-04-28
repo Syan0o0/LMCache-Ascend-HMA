@@ -2394,7 +2394,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 caller_name,
             )
             group_block_ids = block_ids_by_group[group_ctx.group_idx]
-            logger.info(
+            logger.debug(
                 "GDN align store block req_id=%s group=%d end=%d "
                 "state_block_index=%d block_id=%d block_groups_tail=%s",
                 req_id,
@@ -2481,7 +2481,7 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 caller_name,
             )
             group_block_ids = block_ids_by_group[group_ctx.group_idx]
-            logger.info(
+            logger.debug(
                 "GDN align load block ts_ns=%d req_id=%s group=%d end=%d "
                 "state_block_index=%d block_id=%d block_groups_tail=%s",
                 time.time_ns(),

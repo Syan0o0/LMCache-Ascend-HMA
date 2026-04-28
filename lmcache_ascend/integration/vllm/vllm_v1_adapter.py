@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-import os
 import time
 from types import SimpleNamespace
 from typing import Optional, Tuple
@@ -56,15 +55,6 @@ elif _build_info.__framework_name__ == "mindspore":
     HAS_NPU_CONNECTOR_V3 = False
 
 logger = init_logger(__name__)
-
-_SKIP_LOADED_REQ_STORE = os.getenv(
-    "LMCACHE_SKIP_LOADED_REQ_STORE", "0"
-).lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
 
 def _summarize_tensor_values(tensor: torch.Tensor, limit: int = 6) -> str:
@@ -375,7 +365,7 @@ def start_load_kv(self, forward_context, **kwargs) -> None:
             )
             for group_idx, slot_mapping in enumerate(slot_mappings_by_group)
         )
-        logger.info(
+        logger.debug(
             "External load start ts_ns=%d %s load_slice_fp=%s masked_token_count=%d "
             "slot_mappings=%s",
             time.time_ns(),
@@ -552,18 +542,6 @@ def wait_for_save(self):
             #     len(request.token_ids),
             #     request.is_last_prefill,
             # )
-            continue
-
-        if _SKIP_LOADED_REQ_STORE and request.load_spec is not None:
-            logger.warning(
-                "Skipping KV store for external-loaded request req_id=%s "
-                "token_count=%d lmcache_cached_tokens=%d "
-                "vllm_cached_tokens=%d",
-                request.req_id,
-                len(request.token_ids),
-                request.load_spec.lmcache_cached_tokens,
-                request.load_spec.vllm_cached_tokens,
-            )
             continue
 
         token_ids = request.token_ids
