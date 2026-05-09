@@ -78,6 +78,18 @@ struct MultiLayerKVConfig {
   int64_t dsa_hidden_dims;
 };
 
+struct GDNStateTransferConfig {
+  aclrtStream stream;
+  at::ScalarType scalar_type;
+  const char *socName;
+
+  uint32_t aiv_num;
+
+  int32_t num_layers;
+  int64_t slice_numel;
+  bool direction;
+};
+
 MultiLayerKVConfig prepare_multi_layer_kv_config(
     const torch::Tensor &key_value, const torch::Tensor &key_value_ptrs,
     const torch::Tensor &slot_mapping, const torch::Device &paged_memory_device,
@@ -89,6 +101,12 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
                                    const torch::Tensor &key_value,
                                    const torch::Device &paged_memory_device,
                                    const torch::Tensor &key_value_ptrs);
+
+GDNStateTransferConfig
+prepare_gdn_state_transfer_config(const torch::Tensor &memory_tensor,
+                                  const torch::Device &runtime_device,
+                                  int32_t num_layers, int64_t slice_numel,
+                                  bool direction);
 struct KVTransferDims {
   int32_t num_tokens;
   int32_t num_heads;

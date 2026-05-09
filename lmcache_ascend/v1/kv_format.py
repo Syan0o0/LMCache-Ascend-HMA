@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from enum import Enum, auto
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 # Third Party
 from lmcache.logging import init_logger
@@ -60,6 +60,14 @@ class KVCacheFormat(Enum):
     This format is used for sparse attention with lightning indexer.
     """
 
+    GDN_ALIGN_STATE = auto()
+    """HMA Gated DeltaNet align-state format.
+
+    layer: sequence of state tensors, typically [conv_state, ssm_state]
+    - conv_state.shape = [num_blocks, ...]
+    - ssm_state.shape = [num_blocks, ...]
+    """
+
     def is_separate_format(self) -> bool:
         return self == KVCacheFormat.SEPARATE_KV
 
@@ -72,17 +80,25 @@ class KVCacheFormat(Enum):
     def is_dsa_format(self) -> bool:
         return self == KVCacheFormat.DSA_KV
 
+    def is_gdn_state_format(self) -> bool:
+        return self == KVCacheFormat.GDN_ALIGN_STATE
+
     def is_tuple_format(self) -> bool:
         return self in (
             KVCacheFormat.SEPARATE_KV,
             KVCacheFormat.MLA_KV,
             KVCacheFormat.DSA_KV,
+            KVCacheFormat.GDN_ALIGN_STATE,
         )
 
     def get_kv_size(self) -> int:
         if self == KVCacheFormat.DSA_KV:
             return 3
-        elif self in (KVCacheFormat.SEPARATE_KV, KVCacheFormat.MLA_KV):
+        elif self in (
+            KVCacheFormat.SEPARATE_KV,
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.GDN_ALIGN_STATE,
+        ):
             return 2
         elif self == KVCacheFormat.MERGED_KV:
             return 1
@@ -92,6 +108,7 @@ class KVCacheFormat(Enum):
     def detect(
         kvcaches: List[Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
         use_mla: bool = False,
+        group_kind: Optional[str] = None,
     ) -> "KVCacheFormat":
         """
         Automatically detect KV cache format based on data structure.
@@ -102,6 +119,9 @@ class KVCacheFormat(Enum):
         3. SEPARATE_KV: tuple with 2 elements where K/V shapes are same
         4. MERGED_KV: single tensor with specific shape patterns
         """
+        if group_kind == "gdn":
+            return KVCacheFormat.GDN_ALIGN_STATE
+
         if not kvcaches:
             return KVCacheFormat.UNDEFINED
 

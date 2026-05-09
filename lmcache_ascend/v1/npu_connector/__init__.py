@@ -20,6 +20,7 @@ if _build_info.__framework_name__ == "pytorch":
         VLLMBufferLayerwiseNPUConnector,
         VLLMPagedMemLayerwiseNPUConnector,
         VLLMPagedMemNPUConnectorV2,
+        VLLMPagedMemNPUConnectorV3,
     )
 elif _build_info.__framework_name__ == "mindspore":
     # First Party
@@ -68,9 +69,10 @@ def CreateNPUConnector(
             return conn
 
         if config.use_gpu_connector_v3:
-            raise NotImplementedError(
-                "GPU Connector v3 is not supported yet. Please contact LMCache-Ascend."
+            conn = VLLMPagedMemNPUConnectorV3.from_metadata(
+                metadata, use_gpu, device, layout_hints=layout_hints
             )
+            return conn
         else:
             conn = VLLMPagedMemNPUConnectorV2.from_metadata(
                 metadata, use_gpu, device, layout_hints=layout_hints

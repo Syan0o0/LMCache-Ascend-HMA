@@ -234,8 +234,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
                 num_tokens = end - start
-                kv_shapes = self.metadata.get_shapes(num_tokens)
-                kv_dtypes = self.metadata.get_dtypes()
+                # HMA-style groups may transfer as a composite chunk whose
+                # physical layout differs from the logical per-group KV shape.
+                kv_shapes = self.metadata.get_transfer_shapes(num_tokens)
+                kv_dtypes = self.metadata.get_transfer_dtypes()
 
                 # TODO (Jiayi): should be batched in the future
                 memory_obj = self.storage_manager.allocate(

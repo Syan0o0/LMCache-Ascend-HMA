@@ -33,6 +33,12 @@ void multi_layer_kv_transfer_kernel_v2(
     const int64_t kHiddenDims = 0, const int64_t vHiddenDims = 0,
     const int64_t dsaHiddenDims = 0);
 
+void multi_layer_gdn_state_transfer_kernel(
+    kvcache_ops::AscendType type, uint32_t blockDim, void *stream,
+    uint8_t *memoryTensor, uint8_t *statePtrs, const int64_t blockId,
+    const int32_t numLayers, const int64_t sliceNumel,
+    const bool stateToMemory);
+
 void single_layer_kv_transfer_kernel_v2(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     uint32_t blockDim, void *stream, uint8_t *lmcKeyValueCache,
@@ -81,6 +87,11 @@ void fused_multi_layer_kv_transfer(
     const bool direction, const bool use_mla, const int kvcache_format_raw,
     const int64_t k_hidden_dims = 0, const int64_t v_hidden_dims = 0,
     const int64_t dsa_hidden_dims = 0);
+
+void multi_layer_gdn_state_transfer(
+    std::vector<torch::Tensor> &memory_tensors,
+    std::vector<torch::Tensor> &state_tensors, const int64_t block_id,
+    const bool direction);
 
 void multi_layer_kv_transfer_310p(
     torch::Tensor &key_value,            // [kv, num_layer, num_tokens, hidden]

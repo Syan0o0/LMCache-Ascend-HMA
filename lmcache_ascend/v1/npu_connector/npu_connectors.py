@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any, List, Optional, Set, Union
+from dataclasses import dataclass
+from typing import Any, List, Optional, Sequence, Set, Tuple, Union
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -8,6 +9,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.gpu_connectors import (
+    GPUConnectorInterface,
     SGLangGPUConnector,
     SGLangLayerwiseGPUConnector,
     VLLMBufferLayerwiseGPUConnector,
@@ -38,6 +40,102 @@ def is_310p():
 
         _IS_310P = _build_info.__soc_version__.lower().startswith("ascend310p")
     return _IS_310P
+
+
+def _tensorize_slot_mapping(
+    slot_mapping: Union[torch.Tensor, List[int]],
+) -> torch.Tensor:
+    if isinstance(slot_mapping, torch.Tensor):
+        return slot_mapping.to(dtype=torch.long)
+    return torch.tensor(slot_mapping, dtype=torch.long)
+
+
+def _get_slot_mappings_by_group_from_kwargs(
+    kwargs,
+) -> Tuple[torch.Tensor, ...]:
+    slot_mappings_by_group = kwargs.get("slot_mappings_by_group")
+    legacy_slot_mapping = kwargs.get("slot_mapping")
+
+    if slot_mappings_by_group is None and legacy_slot_mapping is None:
+        raise ValueError(
+            "Either 'slot_mappings_by_group' or 'slot_mapping' should be "
+            "provided in kwargs."
+        )
+
+    if slot_mappings_by_group is not None:
+        if not isinstance(slot_mappings_by_group, tuple):
+            raise ValueError(
+                "'slot_mappings_by_group' should be a tuple of slot mappings."
+            )
+        normalized = tuple(
+            _tensorize_slot_mapping(slot_mapping)
+            for slot_mapping in slot_mappings_by_group
+        )
+    else:
+        assert legacy_slot_mapping is not None
+        normalized = (_tensorize_slot_mapping(legacy_slot_mapping),)
+
+    if legacy_slot_mapping is not None:
+        legacy_tensor = _tensorize_slot_mapping(legacy_slot_mapping)
+        if len(normalized) != 1:
+            raise ValueError(
+                "Both 'slot_mapping' and multi-group "
+                "'slot_mappings_by_group' were provided."
+            )
+        if not torch.equal(normalized[0], legacy_tensor):
+            raise ValueError(
+                "'slot_mapping' and 'slot_mappings_by_group[0]' do not match."
+            )
+
+    return normalized
+
+
+def _get_block_ids_by_group_from_kwargs(
+    kwargs,
+    caller_name: str,
+) -> Tuple[List[int], ...]:
+    block_ids_by_group = kwargs.get("block_ids_by_group")
+    legacy_block_ids = kwargs.get("block_ids")
+
+    if block_ids_by_group is None and legacy_block_ids is None:
+        raise ValueError(
+            f"{caller_name} requires 'block_ids_by_group' for GDN state transfer."
+        )
+
+    if block_ids_by_group is not None:
+        if not isinstance(block_ids_by_group, tuple):
+            raise ValueError("'block_ids_by_group' should be a tuple of block-id lists.")
+        normalized = tuple(list(group_block_ids) for group_block_ids in block_ids_by_group)
+    else:
+        assert legacy_block_ids is not None
+        normalized = (list(legacy_block_ids),)
+
+    if legacy_block_ids is not None:
+        if len(normalized) != 1:
+            raise ValueError(
+                "Both 'block_ids' and multi-group 'block_ids_by_group' were provided."
+            )
+        if normalized[0] != list(legacy_block_ids):
+            raise ValueError("'block_ids' and 'block_ids_by_group[0]' do not match.")
+
+    return normalized
+
+
+@dataclass
+class _NPUV3GroupContext:
+    group_idx: int
+    layer_indices: List[int]
+    num_layers: int
+    kv_format: KVCacheFormat
+    group_kind: str = "attention"
+    num_tensors: int = 1
+    memory_tensor_start: int = 0
+    memory_tensor_end: int = 1
+    block_size: int = 0
+    tensor_names: Optional[List[str]] = None
+    kv_cache_pointers_on_device: Optional[torch.Tensor] = None
+    page_buffer_size: int = 0
+    tmp_buffer: Optional[torch.Tensor] = None
 
 
 class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
@@ -1107,6 +1205,650 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             return torch.Size(
                 [kv_size, self.num_layers, num_tokens, self.hidden_dim_size]
             )
+
+
+class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
+    def __init__(
+        self,
+        metadata: LMCacheMetadata,
+        device: torch.device,
+        use_gpu: bool = False,
+        layout_hints: Optional[LayoutHints] = None,
+    ):
+        del layout_hints
+        assert device.type == "npu", "The device should be Ascend NPU."
+        self.metadata = metadata
+        self.device = device
+        self.use_mla = metadata.use_mla
+        self.chunk_size = metadata.chunk_size
+        self.use_gpu = use_gpu
+        self.kvcaches: Optional[
+            List[Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]]]
+        ] = None
+        self.group_contexts: Optional[List[_NPUV3GroupContext]] = None
+        self.init = False
+        self.store_stream = torch.cuda.Stream()
+        self.load_stream = torch.cuda.Stream()
+
+    @classmethod
+    def from_metadata(
+        cls,
+        metadata: LMCacheMetadata,
+        use_gpu: bool = False,
+        device: Optional[torch.device] = None,
+        layout_hints: Optional[LayoutHints] = None,
+    ) -> "VLLMPagedMemNPUConnectorV3":
+        assert device is not None
+        return cls(metadata, device, use_gpu, layout_hints=layout_hints)
+
+    def initialize_kvcaches_ptr(self, **kwargs) -> None:
+        kvcaches = kwargs.get("kvcaches")
+        if kvcaches is not None:
+            self.kvcaches = kvcaches
+
+    def _ensure_group_slot_mappings(
+        self,
+        kwargs,
+        caller_name: str,
+    ) -> Tuple[torch.Tensor, ...]:
+        slot_mappings_by_group = _get_slot_mappings_by_group_from_kwargs(kwargs)
+        if self.metadata.get_num_groups() != len(slot_mappings_by_group):
+            raise ValueError(
+                f"{caller_name} received {len(slot_mappings_by_group)} slot mapping "
+                f"groups, but metadata expects {self.metadata.get_num_groups()}."
+            )
+        return slot_mappings_by_group
+
+    def _compute_group_transfer_index_ranges(self) -> List[Tuple[int, int]]:
+        index_ranges: List[Tuple[int, int]] = []
+        cursor = 0
+        for group_transfer_shapes in self.metadata.get_group_transfer_shapes(
+            self.chunk_size
+        ):
+            next_cursor = cursor + len(group_transfer_shapes)
+            index_ranges.append((cursor, next_cursor))
+            cursor = next_cursor
+        return index_ranges
+
+    def _build_group_pointer_tensor(
+        self,
+        group_kvcaches: List[
+            Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]]
+        ],
+        kv_format: KVCacheFormat,
+    ) -> torch.Tensor:
+        if kv_format.is_tuple_format() and not kv_format.is_gdn_state_format():
+            pointers_list: List[int] = []
+            kv_size = kv_format.get_kv_size()
+            for cache_tuple in group_kvcaches:
+                assert isinstance(cache_tuple, (tuple, list))
+                if len(cache_tuple) != kv_size:
+                    raise ValueError(
+                        f"Expected {kv_size} tensors for {kv_format.name}, "
+                        f"got {len(cache_tuple)}."
+                    )
+                for tensor in cache_tuple:
+                    pointers_list.append(tensor.data_ptr())
+            kv_cache_pointers = torch.empty(
+                len(group_kvcaches) * kv_size,
+                dtype=torch.int64,
+                device="cpu",
+            )
+        else:
+            pointers_list = [tensor.data_ptr() for tensor in group_kvcaches]
+            kv_cache_pointers = torch.empty(
+                len(group_kvcaches),
+                dtype=torch.int64,
+                device="cpu",
+            )
+
+        kv_cache_pointers.numpy()[:] = pointers_list
+        kv_cache_pointers_on_device = torch.empty(
+            kv_cache_pointers.shape,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        kv_cache_pointers_on_device.copy_(kv_cache_pointers)
+        return kv_cache_pointers_on_device
+
+    def _extract_group_transfer_params(
+        self,
+        group_kvcaches: List[
+            Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]]
+        ],
+        kv_format: KVCacheFormat,
+    ) -> int:
+        if is_310p():
+            raise NotImplementedError(
+                "VLLMPagedMemNPUConnectorV3 does not support 310P."
+            )
+
+        if kv_format.is_gdn_state_format():
+            return 0
+
+        if kv_format == KVCacheFormat.DSA_KV:
+            representative = group_kvcaches[0]
+            assert isinstance(representative, (tuple, list))
+            k_cache = representative[0]
+            return k_cache.shape[0] * k_cache.shape[1]
+
+        if kv_format == KVCacheFormat.MLA_KV:
+            representative = group_kvcaches[0]
+            assert isinstance(representative, (tuple, list))
+            k_cache = representative[0]
+            return k_cache.shape[0] * k_cache.shape[1]
+
+        if kv_format == KVCacheFormat.SEPARATE_KV:
+            representative = group_kvcaches[0]
+            assert isinstance(representative, (tuple, list))
+            key_tensor = representative[0]
+            return key_tensor.shape[0] * key_tensor.shape[1]
+
+        representative = group_kvcaches[0]
+        assert isinstance(representative, torch.Tensor)
+        if representative.shape[0] == 2:
+            return representative.shape[1] * representative.shape[2]
+        return representative.shape[0] * representative.shape[2]
+
+    def _initialize_group_contexts(self) -> None:
+        if self.init:
+            return
+
+        if is_310p():
+            raise NotImplementedError(
+                "VLLMPagedMemNPUConnectorV3 does not support 310P."
+            )
+
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        assert self.metadata.kv_layer_groups_manager.kv_layer_groups, (
+            "kv_layer_groups_manager must be built before using NPU connector V3."
+        )
+
+        group_transfer_shapes = self.metadata.get_group_transfer_shapes(self.chunk_size)
+        group_transfer_dtypes = self.metadata.get_group_transfer_dtypes()
+        group_transfer_index_ranges = self._compute_group_transfer_index_ranges()
+        block_sizes_by_group = getattr(self.metadata, "kv_group_block_sizes", None)
+        if not block_sizes_by_group:
+            block_sizes_by_group = tuple(
+                0 for _ in range(self.metadata.get_num_groups())
+            )
+
+        self.group_contexts = []
+        group_kinds = self.metadata.get_group_kinds()
+        for group_idx, group in enumerate(
+            self.metadata.kv_layer_groups_manager.kv_layer_groups
+        ):
+            group_kvcaches = [self.kvcaches[layer_idx] for layer_idx in group.layer_indices]
+            kv_format = KVCacheFormat.detect(
+                group_kvcaches,
+                use_mla=self.use_mla,
+                group_kind=group_kinds[group_idx],
+            )
+            if kv_format == KVCacheFormat.UNDEFINED:
+                raise ValueError(
+                    f"Could not detect KV cache format for KV group {group_idx}."
+                )
+
+            kv_cache_pointers_on_device = None
+            if not kv_format.is_gdn_state_format():
+                kv_cache_pointers_on_device = self._build_group_pointer_tensor(
+                    group_kvcaches,
+                    kv_format,
+                )
+
+            page_buffer_size = self._extract_group_transfer_params(
+                group_kvcaches,
+                kv_format,
+            )
+
+            tmp_buffer = None
+            if self.use_gpu and not kv_format.is_gdn_state_format():
+                tmp_buffer = torch.empty(
+                    group_transfer_shapes[group_idx][0],
+                    dtype=group_transfer_dtypes[group_idx][0],
+                    device=self.device,
+                )
+
+            memory_tensor_start, memory_tensor_end = group_transfer_index_ranges[
+                group_idx
+            ]
+            self.group_contexts.append(
+                _NPUV3GroupContext(
+                    group_idx=group_idx,
+                    layer_indices=list(group.layer_indices),
+                    num_layers=group.num_layers,
+                    kv_format=kv_format,
+                    group_kind=group_kinds[group_idx],
+                    num_tensors=group.num_tensors,
+                    memory_tensor_start=memory_tensor_start,
+                    memory_tensor_end=memory_tensor_end,
+                    block_size=block_sizes_by_group[group_idx],
+                    tensor_names=[
+                        tensor_spec.name for tensor_spec in group.tensor_specs
+                    ],
+                    kv_cache_pointers_on_device=kv_cache_pointers_on_device,
+                    page_buffer_size=page_buffer_size,
+                    tmp_buffer=tmp_buffer,
+                )
+            )
+
+        self.init = True
+
+    def _get_group_memory_tensors(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+    ) -> List[torch.Tensor]:
+        tensors: List[torch.Tensor] = []
+        for tensor_idx in range(group_ctx.memory_tensor_start, group_ctx.memory_tensor_end):
+            tensor = memory_obj.get_tensor(tensor_idx)
+            if tensor is None:
+                raise ValueError(
+                    f"Missing memory tensor {tensor_idx} for KV group {group_ctx.group_idx}."
+                )
+            tensors.append(tensor)
+        return tensors
+
+    def _get_attention_group_transfer_tensor(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+    ) -> torch.Tensor:
+        memory_obj_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
+        if len(memory_obj_tensors) != 1:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} expects exactly one transfer "
+                f"tensor, got {len(memory_obj_tensors)}."
+            )
+
+        memory_obj_tensor = memory_obj_tensors[0]
+        if not self.use_mla and memory_obj_tensor.shape[0] != 2:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} expects KV_2LTD tensor with "
+                f"leading kv dim=2, got shape {tuple(memory_obj_tensor.shape)}."
+            )
+        return memory_obj_tensor
+
+    def _run_attention_group_to_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if group_ctx.kv_cache_pointers_on_device is None:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} is missing KV cache pointers."
+            )
+        if group_ctx.page_buffer_size <= 0:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} has invalid page_buffer_size "
+                f"{group_ctx.page_buffer_size}."
+            )
+
+        memory_obj_tensor = self._get_attention_group_transfer_tensor(
+            memory_obj, group_ctx
+        )
+        slot_mapping = slot_mapping.to(
+            device=self.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+        expected_tokens = memory_obj_tensor.shape[2]
+        if slot_mapping.numel() != expected_tokens:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} expects {expected_tokens} "
+                f"slot mappings, got {slot_mapping.numel()}."
+            )
+
+        lmc_ops.multi_layer_kv_transfer(
+            memory_obj_tensor,
+            group_ctx.kv_cache_pointers_on_device,
+            slot_mapping,
+            self.device,
+            group_ctx.page_buffer_size,
+            False,
+            self.use_mla,
+            group_ctx.kv_format.value,
+        )
+
+    def _run_attention_group_from_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if group_ctx.kv_cache_pointers_on_device is None:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} is missing KV cache pointers."
+            )
+        if group_ctx.page_buffer_size <= 0:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} has invalid page_buffer_size "
+                f"{group_ctx.page_buffer_size}."
+            )
+
+        memory_obj_tensor = self._get_attention_group_transfer_tensor(
+            memory_obj, group_ctx
+        )
+        slot_mapping = slot_mapping.to(
+            device=self.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+        expected_tokens = memory_obj_tensor.shape[2]
+        if slot_mapping.numel() != expected_tokens:
+            raise ValueError(
+                f"Attention group {group_ctx.group_idx} expects {expected_tokens} "
+                f"slot mappings, got {slot_mapping.numel()}."
+            )
+
+        can_use_fused = (
+            group_ctx.tmp_buffer is not None
+            and not memory_obj_tensor.is_cuda
+            and group_ctx.tmp_buffer.shape == memory_obj_tensor.shape
+        )
+        if can_use_fused:
+            lmc_ops.fused_multi_layer_kv_transfer(
+                memory_obj_tensor,
+                group_ctx.tmp_buffer,
+                group_ctx.kv_cache_pointers_on_device,
+                slot_mapping,
+                self.device,
+                group_ctx.page_buffer_size,
+                True,
+                self.use_mla,
+                group_ctx.kv_format.value,
+            )
+            return
+
+        lmc_ops.multi_layer_kv_transfer(
+            memory_obj_tensor,
+            group_ctx.kv_cache_pointers_on_device,
+            slot_mapping,
+            self.device,
+            group_ctx.page_buffer_size,
+            True,
+            self.use_mla,
+            group_ctx.kv_format.value,
+        )
+
+    def _get_gdn_state_block_index(
+        self,
+        end: int,
+        block_size: int,
+        caller_name: str,
+    ) -> int:
+        if block_size <= 0:
+            raise ValueError(
+                f"{caller_name} requires a positive GDN block_size, got {block_size}."
+            )
+        if end <= 0:
+            raise ValueError(f"{caller_name} requires end > 0, got {end}.")
+        if end % block_size != 0:
+            raise NotImplementedError(
+                f"{caller_name} only supports GDN chunk ends aligned to the block size. "
+                f"end={end}, block_size={block_size}"
+            )
+        return end // block_size - 1
+
+    def _resolve_gdn_block_id(
+        self,
+        group_ctx: _NPUV3GroupContext,
+        end: int,
+        kwargs,
+        caller_name: str,
+    ) -> int:
+        block_ids_by_group = _get_block_ids_by_group_from_kwargs(kwargs, caller_name)
+        if group_ctx.group_idx >= len(block_ids_by_group):
+            raise ValueError(
+                f"{caller_name} received {len(block_ids_by_group)} block-id groups, "
+                f"but needs group index {group_ctx.group_idx}."
+            )
+        state_block_index = self._get_gdn_state_block_index(
+            end,
+            group_ctx.block_size,
+            caller_name,
+        )
+        group_block_ids = block_ids_by_group[group_ctx.group_idx]
+        if state_block_index >= len(group_block_ids):
+            raise ValueError(
+                f"{caller_name} could not resolve GDN state block index {state_block_index} "
+                f"for group {group_ctx.group_idx}; only {len(group_block_ids)} block ids "
+                "are available."
+            )
+        return group_block_ids[state_block_index]
+
+    def _collect_gdn_group_runtime_state_tensors(
+        self,
+        group_ctx: _NPUV3GroupContext,
+    ) -> List[torch.Tensor]:
+        assert self.kvcaches is not None
+
+        group_kvcaches = [self.kvcaches[layer_idx] for layer_idx in group_ctx.layer_indices]
+        collected_state_tensors: List[torch.Tensor] = []
+        for tensor_idx in range(group_ctx.num_tensors):
+            for layer_cache in group_kvcaches:
+                if not isinstance(layer_cache, (tuple, list)):
+                    raise ValueError(
+                        f"GDN group {group_ctx.group_idx} expects per-layer state tensors, "
+                        f"got {type(layer_cache)}."
+                    )
+                if len(layer_cache) != group_ctx.num_tensors:
+                    raise ValueError(
+                        f"GDN group {group_ctx.group_idx} expects {group_ctx.num_tensors} "
+                        f"runtime tensors, got {len(layer_cache)}."
+                    )
+                state_tensor = layer_cache[tensor_idx]
+                if not isinstance(state_tensor, torch.Tensor):
+                    raise ValueError(
+                        f"GDN group {group_ctx.group_idx} expects runtime tensor, "
+                        f"got {type(state_tensor)}."
+                    )
+                collected_state_tensors.append(state_tensor)
+        return collected_state_tensors
+
+    def _validate_qwen3_5_gdn_group_contract(
+        self,
+        group_ctx: _NPUV3GroupContext,
+        memory_tensors: List[torch.Tensor],
+        state_tensors: List[torch.Tensor],
+    ) -> None:
+        if group_ctx.group_kind != "gdn":
+            raise ValueError(
+                f"GDN operator path requires group_kind='gdn', got {group_ctx.group_kind}."
+            )
+        if not group_ctx.kv_format.is_gdn_state_format():
+            raise ValueError(
+                "GDN operator path requires kv_format=GDN_ALIGN_STATE, "
+                f"got {group_ctx.kv_format.name}."
+            )
+        if group_ctx.num_tensors != 2:
+            raise ValueError(
+                f"First-version GDN operator supports exactly 2 tensors, got "
+                f"{group_ctx.num_tensors}."
+            )
+        if len(memory_tensors) != 2:
+            raise ValueError(
+                f"GDN transfer expects exactly 2 memory tensors, got {len(memory_tensors)}."
+            )
+        if len(state_tensors) != group_ctx.num_layers * group_ctx.num_tensors:
+            raise ValueError(
+                f"GDN transfer expects {group_ctx.num_layers * group_ctx.num_tensors} "
+                f"runtime tensors, got {len(state_tensors)}."
+            )
+
+    def _run_gdn_group_from_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        end: int,
+        **kwargs,
+    ) -> None:
+        if not hasattr(lmc_ops, "multi_layer_gdn_state_transfer"):
+            raise NotImplementedError(
+                "multi_layer_gdn_state_transfer is not available in lmcache_ascend.c_ops."
+            )
+
+        block_id = self._resolve_gdn_block_id(
+            group_ctx,
+            end,
+            kwargs,
+            "VLLMPagedMemNPUConnectorV3.from_gpu",
+        )
+        group_memory_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
+        state_tensors = self._collect_gdn_group_runtime_state_tensors(group_ctx)
+        self._validate_qwen3_5_gdn_group_contract(
+            group_ctx,
+            group_memory_tensors,
+            state_tensors,
+        )
+        lmc_ops.multi_layer_gdn_state_transfer(
+            group_memory_tensors,
+            state_tensors,
+            block_id,
+            True,
+        )
+
+    def _run_gdn_group_to_gpu_op(
+        self,
+        memory_obj: MemoryObj,
+        group_ctx: _NPUV3GroupContext,
+        end: int,
+        **kwargs,
+    ) -> None:
+        if not hasattr(lmc_ops, "multi_layer_gdn_state_transfer"):
+            raise NotImplementedError(
+                "multi_layer_gdn_state_transfer is not available in lmcache_ascend.c_ops."
+            )
+
+        block_id = self._resolve_gdn_block_id(
+            group_ctx,
+            end,
+            kwargs,
+            "VLLMPagedMemNPUConnectorV3.to_gpu",
+        )
+        group_memory_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
+        state_tensors = self._collect_gdn_group_runtime_state_tensors(group_ctx)
+        self._validate_qwen3_5_gdn_group_contract(
+            group_ctx,
+            group_memory_tensors,
+            state_tensors,
+        )
+        lmc_ops.multi_layer_gdn_state_transfer(
+            group_memory_tensors,
+            state_tensors,
+            block_id,
+            False,
+        )
+
+    @_lmcache_nvtx_annotate
+    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        if is_310p():
+            raise NotImplementedError(
+                "VLLMPagedMemNPUConnectorV3 does not support 310P."
+            )
+        if self.use_mla:
+            assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
+        else:
+            assert memory_obj.metadata.fmt == MemoryFormat.KV_2LTD
+
+        slot_mappings_by_group = self._ensure_group_slot_mappings(
+            kwargs, "VLLMPagedMemNPUConnectorV3.to_gpu"
+        )
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+        self._initialize_group_contexts()
+        assert self.group_contexts is not None
+
+        for group_ctx, slot_mapping in zip(
+            self.group_contexts, slot_mappings_by_group, strict=True
+        ):
+            if group_ctx.kv_format.is_gdn_state_format():
+                self._run_gdn_group_to_gpu_op(memory_obj, group_ctx, end, **kwargs)
+                continue
+            self._run_attention_group_to_gpu_op(
+                memory_obj,
+                group_ctx,
+                slot_mapping[start:end],
+            )
+
+    @_lmcache_nvtx_annotate
+    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        if is_310p():
+            raise NotImplementedError(
+                "VLLMPagedMemNPUConnectorV3 does not support 310P."
+            )
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+        slot_mappings_by_group = self._ensure_group_slot_mappings(
+            kwargs, "VLLMPagedMemNPUConnectorV3.from_gpu"
+        )
+        self._initialize_group_contexts()
+        assert self.group_contexts is not None
+
+        with torch.npu.stream(self.store_stream):
+            for group_ctx, slot_mapping in zip(
+                self.group_contexts, slot_mappings_by_group, strict=True
+            ):
+                if group_ctx.kv_format.is_gdn_state_format():
+                    self._run_gdn_group_from_gpu_op(memory_obj, group_ctx, end, **kwargs)
+                    continue
+                self._run_attention_group_from_gpu_op(
+                    memory_obj,
+                    group_ctx,
+                    slot_mapping[start:end],
+                )
+
+        no_sync = kwargs.get("no_sync", False)
+        if not no_sync:
+            self.store_stream.synchronize()
+
+        if self.use_mla:
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+
+    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        self._ensure_group_slot_mappings(
+            kwargs, "VLLMPagedMemNPUConnectorV3.batched_to_gpu"
+        )
+        if any(isinstance(m, ProxyMemoryObj) for m in memory_objs):
+            raise NotImplementedError(
+                "VLLMPagedMemNPUConnectorV3 does not support ProxyMemoryObj."
+            )
+
+        with torch.cuda.stream(self.load_stream):
+            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+                self.to_gpu(memory_obj, start, end, **kwargs)
+        self.load_stream.synchronize()
+
+    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        self._ensure_group_slot_mappings(
+            kwargs, "VLLMPagedMemNPUConnectorV3.batched_from_gpu"
+        )
+        kwargs = dict(kwargs)
+        kwargs["no_sync"] = True
+
+        ordering_event = kwargs.pop("ordering_event", None)
+        current_stream = torch.npu.current_stream()
+        if ordering_event is not None:
+            self.store_stream.wait_event(ordering_event)
+        else:
+            self.store_stream.wait_stream(current_stream)
+
+        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+            self.from_gpu(memory_obj, start, end, **kwargs)
+        self.store_stream.synchronize()
+
+        if self.use_mla:
+            for memory_obj in memory_objs:
+                memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        del num_tokens
+        raise NotImplementedError(
+            "VLLMPagedMemNPUConnectorV3 uses metadata.get_transfer_shapes() per KV group."
+        )
 
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
