@@ -555,7 +555,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        _, return_params = super().request_finished(request, block_ids)
+        return self.request_finished_all_groups(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # The upstream 4.3 cleanup path is still keyed by request id; the
+        # block ids are only part of the HMA connector interface here.
+        primary_block_ids = block_ids[0] if block_ids else []
+        _, return_params = super().request_finished(request, primary_block_ids)
 
         if (
             request.status == RequestStatus.FINISHED_ABORTED

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
 from vllm.config import VllmConfig
@@ -27,6 +27,7 @@ from lmcache.integration.vllm.lmcache_connector_v1 import LMCacheConnectorV1Dyna
 
 if TYPE_CHECKING:
     # Third Party
+    from vllm.v1.request import Request
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -44,3 +45,10 @@ class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
             role=role,
             kv_cache_config=kv_cache_config,
         )
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        return self._lmcache_engine.request_finished_all_groups(request, block_ids)
