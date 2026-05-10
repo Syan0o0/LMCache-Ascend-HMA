@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
+from typing import TYPE_CHECKING, Optional
+
 # Third Party
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
+    SupportsHMA,
+)
 from vllm.logger import init_logger
 
 # First Party
@@ -19,9 +25,22 @@ else:
 # Third Party
 from lmcache.integration.vllm.lmcache_connector_v1 import LMCacheConnectorV1Dynamic
 
+if TYPE_CHECKING:
+    # Third Party
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
 logger = init_logger(__name__)
 
 
-class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole) -> None:
-        super().__init__(vllm_config=vllm_config, role=role)
+class LMCacheAscendConnectorV1Dynamic(LMCacheConnectorV1Dynamic, SupportsHMA):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ) -> None:
+        super().__init__(
+            vllm_config=vllm_config,
+            role=role,
+            kv_cache_config=kv_cache_config,
+        )
