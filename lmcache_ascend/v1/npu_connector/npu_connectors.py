@@ -136,6 +136,9 @@ class _NPUV3GroupContext:
     kv_cache_pointers_on_device: Optional[torch.Tensor] = None
     page_buffer_size: int = 0
     tmp_buffer: Optional[torch.Tensor] = None
+    k_hidden_dims: int = 0
+    v_hidden_dims: int = 0
+    dsa_hidden_dims: int = 0
 
 
 class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
@@ -1350,6 +1353,27 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             return representative.shape[1] * representative.shape[2]
         return representative.shape[0] * representative.shape[2]
 
+    def _extract_group_hidden_dims(
+        self,
+        group_kvcaches: List[
+            Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]]
+        ],
+        kv_format: KVCacheFormat,
+    ) -> tuple[int, int, int]:
+        if kv_format == KVCacheFormat.MLA_KV:
+            representative = group_kvcaches[0]
+            assert isinstance(representative, (tuple, list))
+            k_cache, v_cache = representative
+            return k_cache.shape[-1], v_cache.shape[-1], 0
+
+        if kv_format == KVCacheFormat.DSA_KV:
+            representative = group_kvcaches[0]
+            assert isinstance(representative, (tuple, list))
+            k_cache, v_cache, dsa_k_cache = representative
+            return k_cache.shape[-1], v_cache.shape[-1], dsa_k_cache.shape[-1]
+
+        return 0, 0, 0
+
     def _initialize_group_contexts(self) -> None:
         if self.init:
             return
@@ -1402,6 +1426,9 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 group_kvcaches,
                 kv_format,
             )
+            k_hidden_dims, v_hidden_dims, dsa_hidden_dims = (
+                self._extract_group_hidden_dims(group_kvcaches, kv_format)
+            )
 
             tmp_buffer = None
             if self.use_gpu and not kv_format.is_gdn_state_format():
@@ -1431,6 +1458,9 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                     kv_cache_pointers_on_device=kv_cache_pointers_on_device,
                     page_buffer_size=page_buffer_size,
                     tmp_buffer=tmp_buffer,
+                    k_hidden_dims=k_hidden_dims,
+                    v_hidden_dims=v_hidden_dims,
+                    dsa_hidden_dims=dsa_hidden_dims,
                 )
             )
 
@@ -1511,6 +1541,9 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             False,
             self.use_mla,
             group_ctx.kv_format.value,
+            group_ctx.k_hidden_dims,
+            group_ctx.v_hidden_dims,
+            group_ctx.dsa_hidden_dims,
         )
 
     def _run_attention_group_from_gpu_op(
@@ -1560,6 +1593,9 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
                 True,
                 self.use_mla,
                 group_ctx.kv_format.value,
+                group_ctx.k_hidden_dims,
+                group_ctx.v_hidden_dims,
+                group_ctx.dsa_hidden_dims,
             )
             return
 
@@ -1572,6 +1608,9 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             True,
             self.use_mla,
             group_ctx.kv_format.value,
+            group_ctx.k_hidden_dims,
+            group_ctx.v_hidden_dims,
+            group_ctx.dsa_hidden_dims,
         )
 
     def _get_gdn_state_block_index(
