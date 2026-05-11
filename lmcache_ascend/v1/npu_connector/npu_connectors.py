@@ -1736,6 +1736,33 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             kwargs,
             "VLLMPagedMemNPUConnectorV3.from_gpu",
         )
+        state_block_index = self._get_gdn_state_block_index(
+            end,
+            group_ctx.block_size,
+            "VLLMPagedMemNPUConnectorV3.from_gpu",
+        )
+        block_ids_by_group = _get_block_ids_by_group_from_kwargs(
+            kwargs, "VLLMPagedMemNPUConnectorV3.from_gpu"
+        )
+        group_block_ids = (
+            block_ids_by_group[group_ctx.group_idx]
+            if group_ctx.group_idx < len(block_ids_by_group)
+            else []
+        )
+        logger.debug(
+            "HMA GDN store block: req_id=%s group=%d end=%d "
+            "block_size=%d state_block_index=%d block_id=%d "
+            "num_block_groups=%d group_block_ids_len=%d group_block_ids_tail=%s",
+            kwargs.get("req_id"),
+            group_ctx.group_idx,
+            end,
+            group_ctx.block_size,
+            state_block_index,
+            block_id,
+            len(block_ids_by_group),
+            len(group_block_ids),
+            group_block_ids[-6:] if group_block_ids else "N/A",
+        )
         group_memory_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
         state_tensors = self._collect_gdn_group_runtime_state_tensors(group_ctx)
         self._validate_qwen3_5_gdn_group_contract(
@@ -1767,6 +1794,21 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             end,
             kwargs,
             "VLLMPagedMemNPUConnectorV3.to_gpu",
+        )
+        state_block_index = self._get_gdn_state_block_index(
+            end,
+            group_ctx.block_size,
+            "VLLMPagedMemNPUConnectorV3.to_gpu",
+        )
+        logger.debug(
+            "HMA GDN load block: req_id=%s group=%d end=%d "
+            "block_size=%d state_block_index=%d block_id=%d",
+            kwargs.get("req_id"),
+            group_ctx.group_idx,
+            end,
+            group_ctx.block_size,
+            state_block_index,
+            block_id,
         )
         group_memory_tensors = self._get_group_memory_tensors(memory_obj, group_ctx)
         state_tensors = self._collect_gdn_group_runtime_state_tensors(group_ctx)
@@ -1805,6 +1847,17 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             self.group_contexts, slot_mappings_by_group, strict=True
         ):
             if group_ctx.kv_format.is_gdn_state_format():
+                gdn_align_last_end = kwargs.get("gdn_align_last_end")
+                if gdn_align_last_end is not None and end != gdn_align_last_end:
+                    logger.debug(
+                        "HMA GDN load last-only: skip non-last chunk "
+                        "req_id=%s group=%d end=%d last_end=%d",
+                        kwargs.get("req_id"),
+                        group_ctx.group_idx,
+                        end,
+                        gdn_align_last_end,
+                    )
+                    continue
                 self._run_gdn_group_to_gpu_op(memory_obj, group_ctx, end, **kwargs)
                 continue
             self._run_attention_group_to_gpu_op(
@@ -1855,6 +1908,9 @@ class VLLMPagedMemNPUConnectorV3(GPUConnectorInterface):
             raise NotImplementedError(
                 "VLLMPagedMemNPUConnectorV3 does not support ProxyMemoryObj."
             )
+
+        kwargs = dict(kwargs)
+        kwargs["gdn_align_last_end"] = max(ends) if ends else None
 
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):

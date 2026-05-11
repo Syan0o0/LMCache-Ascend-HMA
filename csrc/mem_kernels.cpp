@@ -341,8 +341,8 @@ void multi_layer_gdn_state_transfer(
                 "ssm_state block_id out of range at layer ", layer_pos,
                 ": block_id=", block_id, ", num_blocks=", ssm_state.size(0), ".");
 
-    conv_state_tensors.push_back(conv_state[block_id]);
-    ssm_state_tensors.push_back(ssm_state[block_id]);
+    conv_state_tensors.push_back(conv_state);
+    ssm_state_tensors.push_back(ssm_state);
   }
 
   run_single_gdn_tensor_family_transfer(memory_tensors[0], conv_state_tensors,
